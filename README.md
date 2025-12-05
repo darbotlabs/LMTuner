@@ -6,7 +6,7 @@
 ███████╗   ██║ ╚═╝ ██║       ██║       ╚██████╔╝   ██║ ╚█████║   ███████╗   ██║  ██║  
 ╚══════╝   ╚═╝     ╚═╝       ╚═╝        ╚═════╝    ╚═╝  ╚═══╝    ╚══════╝   ╚═╝  ╚═╝
   
-[![PyPI release](https://img.shields.io/pypi/v/lmcli)](https://pypi.org/project/lmcli/)
+[![GitHub](https://img.shields.io/badge/GitHub-LMTuner-blue)](https://github.com/darbotlabs/LMTuner)
 [![Documentation](https://img.shields.io/website/https/microsoft.github.io/Olive?down_color=red&down_message=offline&up_message=online)](https://microsoft.github.io/Olive/)
 
 ## AI Model Optimization Toolkit for the ONNX Runtime
@@ -27,7 +27,7 @@ pip install lmcli[auto-opt]
 pip install transformers onnxruntime-genai
 ```
 > [!NOTE]
-> LMTuner has optional dependencies that can be installed to enable additional features. Please refer to [olive package config](./olive/olive_config.json) for the list of extras and their dependencies.
+> LMTuner has optional dependencies that can be installed to enable additional features. Please refer to [LMTuner package configuration](./olive/olive_config.json) for the list of extras and their dependencies.
 
 #### 2. Automatic Optimizer
 
