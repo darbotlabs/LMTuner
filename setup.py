@@ -64,16 +64,16 @@ long_description = (
 description = long_description.split(".", maxsplit=1)[0] + "."
 
 setup(
-    name="olive-ai",
+    name="lmcli",
     version=VERSION,
     description=description,
     long_description=long_description,
-    author="Microsoft Corporation",
-    author_email="olivedevteam@microsoft.com",
+    author="DarbotLabs",
+    author_email="info@darbotlabs.ai",
     license="MIT License",
     classifiers=CLASSIFIERS,
-    url="https://microsoft.github.io/Olive/",
-    download_url="https://github.com/microsoft/Olive/tags",
+    url="https://github.com/darbotlabs/LMTuner",
+    download_url="https://github.com/darbotlabs/LMTuner/tags",
     packages=find_packages(include=["olive*"]),
     python_requires=">=3.10",
     install_requires=requirements,
@@ -87,6 +87,6 @@ setup(
     },
     data_files=[],
     entry_points={
-        "console_scripts": ["olive=olive.cli.launcher:main"],
+        "console_scripts": ["lmcli=olive.cli.launcher:main", "olive=olive.cli.launcher:main"],
     },
 )

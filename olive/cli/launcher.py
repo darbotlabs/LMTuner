@@ -11,6 +11,7 @@ from olive.cli.benchmark import BenchmarkCommand
 from olive.cli.capture_onnx import CaptureOnnxGraphCommand
 from olive.cli.configure_qualcomm_sdk import ConfigureQualcommSDKCommand
 from olive.cli.convert_adapters import ConvertAdaptersCommand
+from olive.cli.copilot import CopilotCommand
 from olive.cli.extract_adapters import ExtractAdaptersCommand
 from olive.cli.finetune import FineTuneCommand
 from olive.cli.generate_adapter import GenerateAdapterCommand
@@ -24,12 +25,12 @@ from olive.cli.shared_cache import SharedCacheCommand
 
 
 def get_cli_parser(called_as_console_script: bool = True) -> ArgumentParser:
-    """Get the CLI parser for Olive.
+    """Get the CLI parser for LMTuner.
 
     :param called_as_console_script: Whether the script was called as a console script.
     :return: The CLI parser.
     """
-    parser = ArgumentParser("Olive CLI tool", usage="olive" if called_as_console_script else "python -m olive")
+    parser = ArgumentParser("LMTuner CLI tool", usage="lmcli" if called_as_console_script else "python -m olive")
     commands_parser = parser.add_subparsers()
 
     # Register commands
@@ -50,6 +51,7 @@ def get_cli_parser(called_as_console_script: bool = True) -> ArgumentParser:
     SharedCacheCommand.register_subcommand(commands_parser)
     ExtractAdaptersCommand.register_subcommand(commands_parser)
     BenchmarkCommand.register_subcommand(commands_parser)
+    CopilotCommand.register_subcommand(commands_parser)
 
     return parser
 
@@ -79,7 +81,7 @@ def legacy_call(deprecated_module: str, command_name: str, *args):
     """
     warn(
         f"Running `python -m {deprecated_module}` is deprecated and might be removed in the future. Please use"
-        f" `olive {command_name}` or `python -m olive {command_name}` instead.",
+        f" `lmcli {command_name}` or `python -m olive {command_name}` instead.",
         FutureWarning,
     )
 
