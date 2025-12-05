@@ -158,7 +158,7 @@ class CopilotCommand(BaseOliveCLICommand):
             {
                 "recommended_precision": "int4 or int8",
                 "optimization_passes": ["Quantization", "ONNX optimization"],
-                "example_command": f"""lmcli optimize \\
+                "example_command": """lmcli optimize \\
     --model_name_or_path <your-model> \\
     --precision int4 \\
     --output_path models/optimized""",
@@ -171,14 +171,14 @@ class CopilotCommand(BaseOliveCLICommand):
         )
 
         print(f"\n📊 Recommended Precision: {model_suggestions['recommended_precision']}")
-        print(f"\n🔧 Optimization Passes:")
+        print("\n🔧 Optimization Passes:")
         for pass_name in model_suggestions["optimization_passes"]:
             print(f"  • {pass_name}")
 
-        print(f"\n💡 Example Command:")
+        print("\n💡 Example Command:")
         print(model_suggestions["example_command"])
 
-        print(f"\n✨ Tips:")
+        print("\n✨ Tips:")
         for tip in model_suggestions["tips"]:
             print(f"  • {tip}")
 
