@@ -1,6 +1,9 @@
     MIT License
 
-    Copyright (c) Microsoft Corporation.
+    LMTuner is a fork of Microsoft Olive with significant framework changes and improvements.
+
+    Original Olive Copyright (c) Microsoft Corporation.
+    LMTuner modifications Copyright (c) 2024 DarbotLabs.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
