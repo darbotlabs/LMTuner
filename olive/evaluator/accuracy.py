@@ -5,7 +5,7 @@
 import logging
 from abc import abstractmethod
 from inspect import isfunction, signature
-from typing import Any, Callable, ClassVar, Union
+from typing import Any, Callable, ClassVar, Optional, Union
 
 import torch
 import torchmetrics
@@ -26,14 +26,15 @@ class AccuracyBase(AutoConfigClass):
         "recall": torchmetrics.Recall,
         "auroc": torchmetrics.AUROC,
         "perplexity": torchmetrics.text.perplexity.Perplexity,
+        "wer": torchmetrics.text.WordErrorRate,
     }
 
-    def __init__(self, config: Union[ConfigBase, dict[str, Any]] = None) -> None:
-        super().__init__(config)
+    def __init__(self, config: Optional[Union[ConfigBase, dict[str, Any]]] = None) -> None:
+        super().__init__(config or {})
         self.resolve_kwargs()
 
     def resolve_kwargs(self):
-        config_dict = self.config.dict()
+        config_dict = self.config.model_dump()
         kwargs = config_dict.pop("kwargs", {})
         config_dict.update(kwargs or {})
         self.config_dict = config_dict
@@ -67,7 +68,7 @@ class AccuracyBase(AutoConfigClass):
         return cls._metric_config_from_torch_metrics()
 
     @staticmethod
-    def prepare_tensors(preds, target, dtypes=torch.int):
+    def prepare_tensors(preds, target, dtypes: Union[torch.dtype, list[torch.dtype], tuple[torch.dtype]] = torch.int):
         dtypes = dtypes if isinstance(dtypes, (list, tuple)) else [dtypes, dtypes]
         assert len(dtypes) == 2, "dtypes should be a list or tuple with two elements."
         preds = torch.tensor(preds, dtype=dtypes[0]) if not isinstance(preds, torch.Tensor) else preds.to(dtypes[0])
@@ -80,7 +81,7 @@ class AccuracyBase(AutoConfigClass):
 
 
 class AccuracyScore(AccuracyBase):
-    name: str = "accuracy_score"
+    name: Optional[str] = "accuracy_score"
 
     def measure(self, model_output, target):
         preds_tensor, target_tensor = self.prepare_tensors(model_output.preds, target)
@@ -90,7 +91,7 @@ class AccuracyScore(AccuracyBase):
 
 
 class F1Score(AccuracyBase):
-    name: str = "f1_score"
+    name: Optional[str] = "f1_score"
 
     def measure(self, model_output, target):
         preds_tensor, target_tensor = self.prepare_tensors(model_output.preds, target)
@@ -100,7 +101,7 @@ class F1Score(AccuracyBase):
 
 
 class Precision(AccuracyBase):
-    name: str = "precision"
+    name: Optional[str] = "precision"
 
     def measure(self, model_output, target):
         preds_tensor, target_tensor = self.prepare_tensors(model_output.preds, target)
@@ -110,7 +111,7 @@ class Precision(AccuracyBase):
 
 
 class Recall(AccuracyBase):
-    name: str = "recall"
+    name: Optional[str] = "recall"
 
     def measure(self, model_output, target):
         preds_tensor, target_tensor = self.prepare_tensors(model_output.preds, target)
@@ -120,7 +121,7 @@ class Recall(AccuracyBase):
 
 
 class AUROC(AccuracyBase):
-    name: str = "auroc"
+    name: Optional[str] = "auroc"
 
     def measure(self, model_output, target):
         logits_tensor, target_tensor = self.prepare_tensors(model_output.logits, target, [torch.float, torch.int32])
@@ -133,7 +134,7 @@ class AUROC(AccuracyBase):
 
 
 class Perplexity(AccuracyBase):
-    name: str = "perplexity"
+    name: Optional[str] = "perplexity"
 
     def measure(self, model_output, target):
         # update ignore_index if not set
@@ -157,3 +158,264 @@ class Perplexity(AccuracyBase):
             perplexity.update(logits, targets)
         result = perplexity.compute()
         return result.item()
+
+
+class WordErrorRate(AccuracyBase):
+    """Word Error Rate metric for speech/ASR evaluation.
+
+    Expects model_output.preds to be a list of predicted transcription strings
+    and target to be a list of reference transcription strings.
+    """
+
+    name: Optional[str] = "wer"
+
+    @classmethod
+    def _default_config(cls) -> dict[str, ConfigParam]:
+        return {
+            "normalize": ConfigParam(type_=bool, default_value=True),
+        }
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """Normalize text for WER: lowercase, strip punctuation, collapse whitespace.
+
+        Word Error Rate is conventionally reported on normalized text so that casing and
+        punctuation (which ASR models emit but references often omit) are not counted as
+        errors. Without this, e.g. FLEURS references (already lowercased, de-punctuated)
+        compared against a chat-style model's cased/punctuated output roughly doubles the WER.
+        """
+        import re
+
+        text = str(text).lower()
+        text = re.sub(r"[^\w\s]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def measure(self, model_output, target):
+        preds = model_output.preds
+        refs = target
+        # Ensure inputs are lists of strings
+        if isinstance(preds, str):
+            preds = [preds]
+        elif not isinstance(preds, list):
+            preds = list(preds)
+        if isinstance(refs, str):
+            refs = [refs]
+        elif not isinstance(refs, list):
+            refs = list(refs)
+
+        config = dict(self.config_dict)
+        if config.pop("normalize", True):
+            preds = [self._normalize(p) for p in preds]
+            refs = [self._normalize(r) for r in refs]
+
+        wer = torchmetrics.text.WordErrorRate(**config)
+        result = wer(preds, refs)
+        return result.item()
+
+
+class RealTimeFactor(AccuracyBase):
+    """Real-Time Factor (RTFx) metric for speech/ASR evaluation.
+
+    RTFx = total_audio_duration / total_inference_time.
+    A value > 1 means faster than real-time (e.g., RTFx=5 means 5x faster).
+    Timing metadata is provided via model_output.logits dict.
+    """
+
+    name: Optional[str] = "rtfx"
+
+    @classmethod
+    def _default_config(cls) -> dict[str, ConfigParam]:
+        return {}
+
+    def measure(self, model_output, target):
+        timing = model_output.logits
+        if not isinstance(timing, dict) or "total_audio_duration" not in timing:
+            raise ValueError(
+                "RTFx metric requires timing metadata from text-based inference path. "
+                "Ensure the metric is used with speech evaluation (WER + RTFx together)."
+            )
+        total_audio = timing["total_audio_duration"]
+        total_inference = timing["total_inference_time"]
+        if total_inference == 0:
+            return float("inf")
+        return round(total_audio / total_inference, 2)
+
+
+class ExactMatch(AccuracyBase):
+    """Exact match metric for vision VQA evaluation.
+
+    Compares predicted answer strings to ground truth answers using
+    case-insensitive, whitespace-normalized string equality.
+    Returns the fraction of samples with an exact match.
+
+    Suitable for benchmarks: AI2D, ScienceQA, TextVQA, MathVista, MMMU, InterGPS.
+    """
+
+    name: Optional[str] = "exact_match"
+
+    @classmethod
+    def _default_config(cls) -> dict[str, ConfigParam]:
+        return {}
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """Normalize text for comparison: lowercase and collapse whitespace."""
+        return " ".join(text.strip().lower().split())
+
+    def measure(self, model_output, target):
+        preds = model_output.preds
+        refs = target
+        if isinstance(preds, str):
+            preds = [preds]
+        elif not isinstance(preds, list):
+            preds = list(preds)
+        if isinstance(refs, str):
+            refs = [refs]
+        elif not isinstance(refs, list):
+            refs = list(refs)
+
+        if len(preds) != len(refs):
+            raise ValueError(
+                f"Number of predictions ({len(preds)}) does not match "
+                f"number of references ({len(refs)}) for exact_match metric."
+            )
+
+        correct = 0
+        for p, r in zip(preds, refs):
+            pred_norm = self._normalize(str(p))
+            # Support multiple valid answers separated by |
+            ref_answers = str(r).split("|") if "|" in str(r) else [str(r)]
+            if any(pred_norm == self._normalize(ref_a) for ref_a in ref_answers):
+                correct += 1
+        return correct / len(refs) if refs else 0.0
+
+
+class RelaxedAccuracy(AccuracyBase):
+    """Relaxed accuracy metric for chart/math VQA evaluation.
+
+    For numeric answers, allows a ±5% tolerance (standard for ChartQA).
+    For non-numeric answers, falls back to exact string match.
+    Returns the fraction of samples that match within tolerance.
+
+    Suitable for benchmarks: ChartQA.
+    """
+
+    name: Optional[str] = "relaxed_accuracy"
+
+    @classmethod
+    def _default_config(cls) -> dict[str, ConfigParam]:
+        return {
+            "tolerance": ConfigParam(type_=float, required=False, default_value=0.05),
+        }
+
+    @staticmethod
+    def _try_parse_number(text: str):
+        """Try to parse text as a number. Returns (True, value) or (False, None)."""
+        text = text.strip().replace(",", "").replace("%", "")
+        try:
+            return True, float(text)
+        except ValueError:
+            return False, None
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return " ".join(text.strip().lower().split())
+
+    def measure(self, model_output, target):
+        preds = model_output.preds
+        refs = target
+        if isinstance(preds, str):
+            preds = [preds]
+        elif not isinstance(preds, list):
+            preds = list(preds)
+        if isinstance(refs, str):
+            refs = [refs]
+        elif not isinstance(refs, list):
+            refs = list(refs)
+
+        if len(preds) != len(refs):
+            raise ValueError(
+                f"Number of predictions ({len(preds)}) does not match "
+                f"number of references ({len(refs)}) for relaxed_accuracy metric."
+            )
+
+        tolerance = self.config_dict.get("tolerance", 0.05)
+        correct = 0
+        for pred, ref in zip(preds, refs):
+            pred_str = str(pred)
+            # Support multiple valid answers separated by |
+            ref_answers = str(ref).split("|") if "|" in str(ref) else [str(ref)]
+            if self._matches_any(pred_str, ref_answers, tolerance):
+                correct += 1
+
+        return correct / len(refs) if refs else 0.0
+
+    def _matches_any(self, pred_str: str, ref_answers: list, tolerance: float) -> bool:
+        """Check if prediction matches any of the reference answers."""
+        pred_is_num, pred_val = self._try_parse_number(pred_str)
+        for ref_str in ref_answers:
+            ref_is_num, ref_val = self._try_parse_number(ref_str)
+            if pred_is_num and ref_is_num:
+                if (ref_val == pred_val) or (ref_val != 0 and abs(pred_val - ref_val) / abs(ref_val) <= tolerance):
+                    return True
+            else:
+                if self._normalize(pred_str) == self._normalize(ref_str):
+                    return True
+        return False
+
+
+class WordSortRatio(AccuracyBase):
+    """Word sort ratio metric for OCR evaluation.
+
+    Computes the ratio of matching words between prediction and reference
+    after sorting words alphabetically. This measures word-level overlap
+    regardless of word order.
+    Returns the average ratio across all samples.
+
+    Suitable for benchmarks: OCR.
+    """
+
+    name: Optional[str] = "word_sort_ratio"
+
+    @classmethod
+    def _default_config(cls) -> dict[str, ConfigParam]:
+        return {}
+
+    @staticmethod
+    def _compute_word_sort_ratio(pred: str, ref: str) -> float:
+        """Compute word sort ratio between two strings."""
+        pred_words = sorted(pred.strip().lower().split())
+        ref_words = sorted(ref.strip().lower().split())
+
+        if not ref_words:
+            return 1.0 if not pred_words else 0.0
+
+        # Count matching words using multiset intersection
+        from collections import Counter
+
+        pred_counter = Counter(pred_words)
+        ref_counter = Counter(ref_words)
+        intersection = sum((pred_counter & ref_counter).values())
+        total = max(len(pred_words), len(ref_words))
+        return intersection / total if total > 0 else 0.0
+
+    def measure(self, model_output, target):
+        preds = model_output.preds
+        refs = target
+        if isinstance(preds, str):
+            preds = [preds]
+        elif not isinstance(preds, list):
+            preds = list(preds)
+        if isinstance(refs, str):
+            refs = [refs]
+        elif not isinstance(refs, list):
+            refs = list(refs)
+
+        if len(preds) != len(refs):
+            raise ValueError(
+                f"Number of predictions ({len(preds)}) does not match "
+                f"number of references ({len(refs)}) for word_sort_ratio metric."
+            )
+
+        total_ratio = sum(self._compute_word_sort_ratio(str(p), str(r)) for p, r in zip(preds, refs))
+        return total_ratio / len(refs) if refs else 0.0

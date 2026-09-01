@@ -4,12 +4,9 @@
 # --------------------------------------------------------------------------
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 # pylint: disable=W0611, W0212
 
 
-@pytest.mark.unit
 class TestOlivePythonAPI:
     """Test cases for Olive Python API functions."""
 
@@ -18,10 +15,12 @@ class TestOlivePythonAPI:
         from olive import (
             capture_onnx_graph,
             convert_adapters,
+            diffusion_lora,
             extract_adapters,
             finetune,
             generate_adapter,
             generate_cost_model,
+            optimize,
             quantize,
             tune_session_params,
         )
@@ -30,10 +29,12 @@ class TestOlivePythonAPI:
         api_functions = [
             capture_onnx_graph,
             convert_adapters,
+            diffusion_lora,
             extract_adapters,
             finetune,
             generate_adapter,
             generate_cost_model,
+            optimize,
             quantize,
             tune_session_params,
         ]
@@ -70,6 +71,21 @@ class TestOlivePythonAPI:
         mock_cmd_cls.return_value = mock_cmd
 
         result = quantize("test_model")
+
+        mock_cmd_cls.assert_called_once()
+        mock_cmd.run.assert_called_once()
+        assert result is mock_output
+
+    @patch("olive.cli.api.OptimizeCommand")
+    def test_optimize_function_basic(self, mock_cmd_cls):
+        from olive import optimize
+
+        mock_cmd = MagicMock()
+        mock_output = MagicMock()
+        mock_cmd.run.return_value = mock_output
+        mock_cmd_cls.return_value = mock_cmd
+
+        result = optimize("test_model")
 
         mock_cmd_cls.assert_called_once()
         mock_cmd.run.assert_called_once()
@@ -155,11 +171,26 @@ class TestOlivePythonAPI:
         mock_cmd_cls.assert_called_once()
         mock_cmd.run.assert_called_once()
 
+    @patch("olive.cli.api.DiffusionLoraCommand")
+    def test_diffusion_lora_basic(self, mock_cmd_cls):
+        from olive import diffusion_lora
+
+        mock_cmd = MagicMock()
+        mock_output = MagicMock()
+        mock_cmd.run.return_value = mock_output
+        mock_cmd_cls.return_value = mock_cmd
+
+        result = diffusion_lora("runwayml/stable-diffusion-v1-5", data_dir="/path/to/images")
+
+        mock_cmd_cls.assert_called_once()
+        mock_cmd.run.assert_called_once()
+        assert result is mock_output
+
     def test_capture_onnx_graph_integration(self, tmp_path):
         """Test capture_onnx_graph integration with a tiny model."""
         from olive import capture_onnx_graph
 
-        # Use a tiny stub model to minimise download / conversion time
+        # Use a tiny stub model to minimize download / conversion time
         model_id = "hf-internal-testing/tiny-random-bert"
 
         output_dir = tmp_path / "onnx-model"

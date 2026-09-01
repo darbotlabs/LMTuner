@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 from olive.cache import CacheConfig, OliveCache
 from olive.common.config_utils import validate_config
 from olive.common.constants import DEFAULT_WORKFLOW_ID, LOCAL_INPUT_MODEL_ID
+from olive.common.utils import hash_dict
 from olive.engine.config import FAILED_CONFIG, INVALID_CONFIG, PRUNED_CONFIGS, RunPassConfig
 from olive.engine.footprint import Footprint, FootprintNodeMetric
 from olive.engine.output import WorkflowOutput
@@ -29,6 +30,7 @@ from olive.search.search_sample import SearchSample
 from olive.search.search_strategy import SearchStrategy, SearchStrategyConfig
 from olive.systems.common import SystemType
 from olive.systems.system_config import SystemConfig
+from olive.telemetry import action
 
 if TYPE_CHECKING:
     from olive.engine.packaging.packaging_config import PackagingConfig
@@ -47,7 +49,7 @@ class Engine:
 
     def __init__(
         self,
-        olive_config: OlivePackageConfig = None,
+        olive_config: OlivePackageConfig | None = None,
         workflow_id: str = DEFAULT_WORKFLOW_ID,
         search_strategy: Optional[Union[dict[str, Any], SearchStrategyConfig]] = None,
         host: Optional[Union[dict[str, Any], "SystemConfig"]] = None,
@@ -59,7 +61,7 @@ class Engine:
     ):
         self.olive_config = olive_config or OlivePackageConfig.load_default_config()
         self.workflow_id = workflow_id
-        self.search_strategy = SearchStrategy(search_strategy) if search_strategy else None
+        self.search_strategy: SearchStrategy | None = SearchStrategy(search_strategy) if search_strategy else None
 
         # default host
         host = host or {"type": SystemType.Local}
@@ -148,6 +150,7 @@ class Engine:
     def set_input_passes_configs(self, pass_configs: dict[str, list[RunPassConfig]]):
         self.input_passes_configs = pass_configs
 
+    @action
     def run(
         self,
         input_model_config: ModelConfig,
@@ -193,15 +196,14 @@ class Engine:
             self.initialize(log_to_file, log_severity_level)
 
         output_dir: Path = (Path(output_dir) if output_dir else Path.cwd()).resolve()
-        if output_dir.suffix:
+        # Treat as file path only if it has a suffix and is not an existing directory
+        is_file_path = output_dir.suffix and not output_dir.is_dir()
+        if is_file_path:
             output_dir.parent.mkdir(parents=True, exist_ok=True)
+            artifacts_dir = output_dir.parent
         else:
             output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Determine the directory for artifacts (run_history, etc.)
-        # If output_dir is a file path (has suffix), use parent directory
-        # Otherwise use output_dir itself
-        artifacts_dir = output_dir.parent if output_dir.suffix else output_dir
+            artifacts_dir = output_dir
 
         logger.info("Running Olive on accelerator: %s", accelerator_spec)
         with self._create_system():
@@ -252,10 +254,8 @@ class Engine:
 
         self.footprint.record(is_input_model=True, model_id=input_model_id)
 
-        # Determine the directory for artifacts
-        # If output_dir is a file path (has suffix like .onnx), use parent directory
-        # Otherwise use output_dir itself
-        artifacts_dir = output_dir.parent if output_dir.suffix else output_dir
+        # Artifacts directory: file path (has suffix, not existing dir) uses parent
+        artifacts_dir = output_dir.parent if (output_dir.suffix and not output_dir.is_dir()) else output_dir
 
         try:
             if evaluate_input_model and not self.evaluator_config:
@@ -297,12 +297,14 @@ class Engine:
 
     def get_host_device(self):
         # for host device, we will always use the first accelerator device
-        return self.host_config.config.accelerators[0].device if self.host_config.config.accelerators else None
+        if self.host_config and self.host_config.config and self.host_config.config.accelerators:
+            return self.host_config.config.accelerators[0].device
+        return None
 
     def _compute_no_search_pass_configs(self, accelerator_spec: "AcceleratorSpec"):
         self.computed_passes_configs.clear()
         for name, passes_configs in self.input_passes_configs.items():
-            pass_config = validate_config(passes_configs[0].dict(), RunPassConfig)
+            pass_config = validate_config(passes_configs[0].model_dump(), RunPassConfig)
 
             pass_cls: type[Pass] = self.olive_config.import_pass_module(pass_config.type)
             pass_config.config = pass_cls.generate_config(accelerator_spec, pass_config.config, {}, True)
@@ -330,6 +332,8 @@ class Engine:
             failed_pass = pass_flow[len(model_ids)]
             logger.warning("Flow %s is pruned due to failed or invalid config for pass '%s'", pass_flow, failed_pass)
             return
+        else:
+            logger.debug("Signal: %s, %s", signal, model_ids)
 
         if signal is not None and not self.skip_saving_artifacts:
             results_path = artifacts_dir / "metrics.json"
@@ -394,7 +398,7 @@ class Engine:
             if pass_name in sample_passes_configs:
                 sample_pass_config = sample_passes_configs[pass_name]
                 pass_config = passes_configs[sample_pass_config["index"]]
-                pass_config = validate_config(pass_config.dict(), RunPassConfig)
+                pass_config = validate_config(pass_config.model_dump(), RunPassConfig)
 
                 pass_cls = self.olive_config.import_pass_module(pass_config.type)
                 pass_config.config = pass_cls.generate_config(
@@ -420,6 +424,8 @@ class Engine:
         )
         self.search_strategy.initialize(search_space_config, input_model_id, search_space_objectives)
 
+        logger.info("Search space contains %d search points ...", self.search_strategy.max_samples)
+
         for sample in self.search_strategy:  # pylint: disable=not-an-iterable
             self._compute_search_pass_configs(accelerator_spec, sample)
 
@@ -443,6 +449,8 @@ class Engine:
                         sample.search_point,
                         exc_info=True,
                     )
+
+                logger.info("Signal: %s, %s, %s", signal, model_ids, sample.search_point)
 
             # record feedback signal
             self.search_strategy.record_feedback_signal(sample.search_point.index, signal, model_ids, should_prune)
@@ -591,7 +599,7 @@ class Engine:
         model_json = {} if model == FAILED_CONFIG else model.to_json(check_object=check_object)
         self.cache.cache_model(model_id, model_json)
 
-    def _load_model(self, model_id: str) -> Union[ModelConfig, str]:
+    def _load_model(self, model_id: str) -> Optional[Union[ModelConfig, str]]:
         model_json = self.cache.load_model(model_id)
         if model_json is None:
             return None
@@ -641,7 +649,6 @@ class Engine:
             else:
                 logger.info("Run model evaluation for the final model...")
                 signal = self._evaluate_model(model_config, model_id, evaluator_config, accelerator_spec)
-            logger.debug("Signal: %s, %s", signal, model_ids)
         else:
             signal = None
             logger.warning("Skipping evaluation as model was pruned")
@@ -754,7 +761,7 @@ class Engine:
         """Cache the evaluation in the cache directory."""
         evaluation_json = {
             "model_id": model_id,
-            "signal": signal.dict(),
+            "signal": signal.model_dump(),
         }
         self.cache.cache_evaluation(model_id, evaluation_json)
 
@@ -790,8 +797,16 @@ class Engine:
         else:
             model_id_with_accelerator = model_id
 
+        # include a hash of the evaluator config in the cache key so that changing the
+        # evaluation parameters (e.g. metrics, lm-eval tasks/limit/batch_size, or the
+        # ort/ortgenai backend) does not silently reuse a stale result cached for the
+        # same model and accelerator.
+        eval_cache_key = model_id_with_accelerator
+        if evaluator_config is not None:
+            eval_cache_key = f"{model_id_with_accelerator}-{hash_dict(evaluator_config.to_json())[:8]}"
+
         # load evaluation from cache if it exists
-        signal = self._load_evaluation(model_id_with_accelerator)
+        signal = self._load_evaluation(eval_cache_key)
         if signal is not None:
             logger.debug("Loading evaluation from cache ...")
             # footprint evaluation
@@ -809,7 +824,7 @@ class Engine:
         signal = self.target.evaluate_model(model_config, evaluator_config, accelerator_spec)
 
         # cache evaluation
-        self._cache_evaluation(model_id_with_accelerator, signal)
+        self._cache_evaluation(eval_cache_key, signal)
 
         # footprint evaluation
         self.footprint.record(

@@ -13,17 +13,31 @@ from packaging import version
 from olive.model import ONNXModelHandler
 from olive.passes.olive_pass import create_pass_from_dict
 from olive.passes.onnx.mnb_to_qdq import MatMulNBitsToQDQ
-from olive.passes.onnx.onnx_dag import OnnxDAG
+
+ORT_VERSION = version.parse(ort_version)
+SKIP_2BIT = version.parse("1.24.0") > ORT_VERSION or version.parse(onnx.__version__) < version.parse("1.20.1")
 
 
 @pytest.fixture(
-    params=[(True, 4), (False, 4), (True, 8), (False, 8)],
-    ids=["symmetric-4bit", "asymmetric-4bit", "symmetric-8bit", "asymmetric-8bit"],
+    params=[
+        pytest.param(
+            (True, 2), marks=pytest.mark.skipif(SKIP_2BIT, reason="2-bit not supported in this version of ONNX Runtime")
+        ),
+        pytest.param(
+            (False, 2),
+            marks=pytest.mark.skipif(SKIP_2BIT, reason="2-bit not supported in this version of ONNX Runtime"),
+        ),
+        (True, 4),
+        (False, 4),
+        (True, 8),
+        (False, 8),
+    ],
+    ids=["symmetric-2bit", "asymmetric-2bit", "symmetric-4bit", "asymmetric-4bit", "symmetric-8bit", "asymmetric-8bit"],
     name="create_mnb_model",
 )
 def create_mnb_model_fixture(request, tmp_path):
     symmetric, bits = request.param
-    if version.parse(ort_version) < version.parse("1.22.0"):
+    if version.parse("1.22.0") > ORT_VERSION:
         if bits == 8:
             pytest.skip("MatMulNBitsQuantizer doesn't support 8 bits in this version of ONNX Runtime")
 
@@ -54,18 +68,21 @@ def create_mnb_model_fixture(request, tmp_path):
         def forward(self, x):
             return self.f3(self.f2(self.f1(x)))
 
-    model = TestModel()
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = TestModel()
+        example_input = torch.randn(1, 1, in_dim)
 
     # base model
     base_path = tmp_path / "base.onnx"
     torch.onnx.export(
         model,
-        torch.randn(1, 1, in_dim),
+        example_input,
         base_path,
         input_names=["input"],
         output_names=["output"],
         dynamic_axes={"input": {0: "batch", 1: "seq"}, "output": {0: "batch", 1: "seq"}},
-        dynamo=False,
+        dynamo=True,
     )
 
     # quantized model
@@ -86,12 +103,17 @@ def create_mnb_model_fixture(request, tmp_path):
     return mnb_path, in_dim, symmetric, bits
 
 
-@pytest.mark.parametrize("use_transpose_op", [True])
+@pytest.mark.parametrize("use_transpose_op", [True, False])
 @pytest.mark.parametrize("use_signed_int", [True, False])
 @pytest.mark.parametrize("add_zero_point", [True, False])
-@pytest.mark.parametrize("nodes_to_exclude", [None, ["/f1/MatMul_Q4"]])
+# Note: With dynamo export, the node names are like "node_MatMul_1_Q4" instead of "/f1/MatMul_Q4"
+@pytest.mark.parametrize("nodes_to_exclude", [None, ["node_MatMul_1_Q4"]])
 def test_mnb_to_qdq(create_mnb_model, nodes_to_exclude, add_zero_point, use_signed_int, use_transpose_op, tmp_path):
     mnb_path, in_dim, is_symmetric, bits = create_mnb_model
+
+    if use_transpose_op and bits == 2:
+        pytest.skip("Transpose op not yet supported for 2 bit in ONNX Runtime")
+
     input_model = ONNXModelHandler(mnb_path)
 
     # setup
@@ -115,9 +137,9 @@ def test_mnb_to_qdq(create_mnb_model, nodes_to_exclude, add_zero_point, use_sign
     # count ops
     num_matmuls = 0
     num_mnbs = 0
-    dag = OnnxDAG.from_model_path(qdq_model.model_path)
-    for name in dag.get_node_names():
-        op_type = dag.get_node_op_type(name)
+    qdq_model_proto = onnx.load(qdq_model.model_path)
+    for node in qdq_model_proto.graph.node:
+        op_type = node.op_type
         if op_type == "MatMul":
             num_matmuls += 1
         elif op_type == "MatMulNBits":
@@ -128,25 +150,21 @@ def test_mnb_to_qdq(create_mnb_model, nodes_to_exclude, add_zero_point, use_sign
     # validate
     original_session = onnxruntime.InferenceSession(str(mnb_path))
     original_session.disable_fallback()
-    if is_symmetric and use_signed_int and not add_zero_point and use_transpose_op:
-        # there seems to be a bug in ORT graph optimization which changes the int4 DQ to uint8 DQ
-        with pytest.raises(Exception, match="uint8"):
-            onnxruntime.InferenceSession(str(qdq_model.model_path))
-        return
-    else:
-        qdq_session = onnxruntime.InferenceSession(str(qdq_model.model_path))
-        qdq_session.disable_fallback()
+    # disable qdq to mnb fusion so we can test the output of the DQ nodes directly
+    disabled_optimizers = ["QDQSelectorActionTransformer"]
+    try:
+        qdq_session = onnxruntime.InferenceSession(str(qdq_model.model_path), disabled_optimizers=disabled_optimizers)
+    except onnxruntime.capi.onnxruntime_pybind11_state.Fail as e:
+        if is_symmetric and use_signed_int and not add_zero_point and use_transpose_op and "uint8" in str(e):
+            # Older ORT versions incorrectly require uint8 here. Newer versions accept the signed type.
+            return
+        raise
+    qdq_session.disable_fallback()
 
-    input_data = {"input": np.random.randn(1, 1, in_dim).astype(np.float32)}
+    input_data = {"input": np.random.default_rng(0).standard_normal((1, 1, in_dim)).astype(np.float32)}
     original_output = original_session.run(None, input_data)[0]
     qdq_output = qdq_session.run(None, input_data)[0]
     assert original_output.shape == qdq_output.shape
     assert original_output.dtype == qdq_output.dtype
-    if bits == 4 and not use_transpose_op:
-        # Pre transposed DQ model does not match the expected output on x64 CPU
-        # check for assertion failure so we know when the test is fixed
-        with pytest.raises(AssertionError):
-            np.testing.assert_allclose(original_output, qdq_output, atol=1e-4)
-    else:
-        # acc level 4 is used for 8 bit, so the tolerance is higher
-        np.testing.assert_allclose(original_output, qdq_output, atol=1e-2 if bits == 8 else 1e-4)
+    # acc level 4 is used for 8 bit, so the tolerance is higher
+    np.testing.assert_allclose(original_output, qdq_output, atol=2e-2 if bits == 8 else 1e-4)

@@ -6,7 +6,7 @@
 import json
 import logging
 
-from olive.cli.base import BaseOliveCLICommand
+from olive.cli.base import BaseOliveCLICommand, add_telemetry_options
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class CopilotCommand(BaseOliveCLICommand):
             choices=["optimize", "finetune", "quantize", "capture-onnx"],
             help="Show example usage for a specific command",
         )
+        add_telemetry_options(sub_parser)
         sub_parser.set_defaults(func=CopilotCommand)
 
     def run(self):

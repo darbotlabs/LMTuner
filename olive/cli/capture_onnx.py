@@ -13,12 +13,14 @@ from olive.cli.base import (
     add_logging_options,
     add_save_config_file_options,
     add_shared_cache_options,
+    add_telemetry_options,
     get_diffusers_input_model,
     get_input_model_config,
     update_shared_cache_options,
 )
 from olive.common.utils import set_nested_dict_value
 from olive.model.utils.diffusers_utils import is_valid_diffusers_model
+from olive.telemetry import action
 
 
 class ModelBuilderAccuracyLevel(IntEnum):
@@ -64,13 +66,30 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
             help="The device used to run the model to capture the ONNX graph.",
         )
 
-        # PyTorch Exporter options
-        pte_group = sub_parser.add_argument_group("PyTorch Exporter options")
-        pte_group.add_argument(
+        # Mutually exclusive exporter flags
+        exporter_group = sub_parser.add_mutually_exclusive_group()
+        exporter_group.add_argument(
             "--use_dynamo_exporter",
             action="store_true",
             help="Whether to use dynamo_export API to export ONNX model.",
         )
+        exporter_group.add_argument(
+            "--use_model_builder",
+            action="store_true",
+            help="Whether to use Model Builder to capture ONNX model.",
+        )
+        exporter_group.add_argument(
+            "--use_mobius_builder",
+            action="store_true",
+            help=(
+                "Whether to use MobiusBuilder (mobius-onnx) to capture ONNX model. "
+                "Supports multi-component multimodal models (VLMs). "
+                "Requires 'pip install mobius-onnx'."
+            ),
+        )
+
+        # PyTorch Exporter options
+        pte_group = sub_parser.add_argument_group("PyTorch Exporter options")
         pte_group.add_argument(
             "--fixed_param_dict",
             type=parse_dim_dict,
@@ -100,23 +119,18 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
         pte_group.add_argument(
             "--target_opset",
             type=int,
-            default=17,
-            help="The target opset version for the ONNX model. Default is 17.",
+            default=20,
+            help="The target opset version for the ONNX model. Default is 20.",
         )
 
         # Model Builder options
         mb_group = sub_parser.add_argument_group("Model Builder options")
         mb_group.add_argument(
-            "--use_model_builder",
-            action="store_true",
-            help="Whether to use Model Builder to capture ONNX model.",
-        )
-        mb_group.add_argument(
             "--precision",
             type=str,
             default="fp16",
             choices=["fp16", "fp32", "int4", "bf16"],
-            help="The precision of the ONNX model. This is used by Model Builder",
+            help="The precision of the ONNX model. Used by Model Builder and Mobius Builder.",
         )
         mb_group.add_argument(
             "--int4_block_size",
@@ -164,26 +178,37 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
         )
 
         sub_parser.add_argument(
-            "--use_ort_genai", action="store_true", help="Use OnnxRuntime generate() API to run the model"
+            "--use_ort_genai",
+            action="store_true",
+            help=(
+                "Use OnnxRuntime generate() API to run the model. "
+                "Ignored when --use_mobius_builder is set (mobius always emits ORT GenAI artifacts)."
+            ),
         )
 
         add_logging_options(sub_parser)
         add_save_config_file_options(sub_parser)
         add_shared_cache_options(sub_parser)
+        add_telemetry_options(sub_parser)
         sub_parser.set_defaults(func=CaptureOnnxGraphCommand)
 
+    @action
     def run(self):
         return self._run_workflow()
 
     def _get_run_config(self, tempdir: str) -> dict:
         config = deepcopy(TEMPLATE)
 
-        # Check if diffusers model detection is needed
-        is_diffusers = is_valid_diffusers_model(self.args.model_name_or_path) if self.args.model_name_or_path else False
-        if is_diffusers:
-            input_model_config = get_diffusers_input_model(self.args, self.args.model_name_or_path)
-        else:
+        if self.args.use_mobius_builder:
             input_model_config = get_input_model_config(self.args)
+        else:
+            is_diffusers = (
+                is_valid_diffusers_model(self.args.model_name_or_path) if self.args.model_name_or_path else False
+            )
+            if is_diffusers:
+                input_model_config = get_diffusers_input_model(self.args, self.args.model_name_or_path)
+            else:
+                input_model_config = get_input_model_config(self.args)
         assert input_model_config["type"].lower() in {
             "hfmodel",
             "pytorchmodel",
@@ -193,8 +218,14 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
         is_diffusers_model = input_model_config["type"].lower() == "diffusersmodel"
 
         # whether model is in fp16 or bf16 (currently not supported by CPU EP)
-        is_fp16_or_bf16 = (not self.args.use_model_builder and self.args.torch_dtype == "float16") or (
-            self.args.use_model_builder and self.args.precision in ("fp16", "bf16")
+        is_fp16_or_bf16 = (
+            (
+                not self.args.use_model_builder
+                and not self.args.use_mobius_builder
+                and self.args.torch_dtype == "float16"
+            )
+            or (self.args.use_model_builder and self.args.precision in ("fp16", "bf16"))
+            or (self.args.use_mobius_builder and self.args.precision in ("fp16", "bf16"))
         )
         to_replace = [
             ("input_model", input_model_config),
@@ -207,8 +238,18 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
             ),
         ]
 
-        if is_diffusers_model:
+        if self.args.use_mobius_builder:
+            if self.args.precision not in ("fp32", "fp16", "bf16"):
+                raise ValueError(
+                    f"MobiusBuilder supports precisions fp32/fp16/bf16; got '{self.args.precision}'. "
+                    "For INT4, capture in fp32/fp16/bf16 first and run a quantization pass afterwards."
+                )
+            del config["passes"]["c"]
             del config["passes"]["m"]
+            to_replace.append((("passes", "b", "precision"), self.args.precision))
+        elif is_diffusers_model:
+            del config["passes"]["m"]
+            del config["passes"]["b"]
             to_replace.extend(
                 [
                     (
@@ -221,6 +262,7 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
             )
         elif self.args.use_model_builder:
             del config["passes"]["c"]
+            del config["passes"]["b"]
             to_replace.extend(
                 [
                     (("passes", "m", "precision"), self.args.precision),
@@ -241,6 +283,7 @@ class CaptureOnnxGraphCommand(BaseOliveCLICommand):
             if self.args.int4_accuracy_level is not None:
                 to_replace.append((("passes", "m", "int4_accuracy_level"), self.args.int4_accuracy_level))
         else:
+            del config["passes"]["b"]
             to_replace.extend(
                 [
                     (
@@ -296,6 +339,7 @@ TEMPLATE = {
             "type": "OnnxConversion",
         },
         "m": {"type": "ModelBuilder", "metadata_only": False},
+        "b": {"type": "MobiusBuilder"},
         "f": {"type": "DynamicToFixedShape"},
     },
     "host": "local_system",

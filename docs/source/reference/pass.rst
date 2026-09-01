@@ -104,6 +104,12 @@ OnnxBlockWiseRtnQuantization
 ----------------------------
 .. autoconfigclass:: olive.passes.OnnxBlockWiseRtnQuantization
 
+.. _onnx_kquant_quantization:
+
+OnnxKQuantQuantization
+-----------------------
+.. autoconfigclass:: olive.passes.OnnxKQuantQuantization
+
 .. _onnx_hqq_quantization:
 
 OnnxHqqQuantization
@@ -115,6 +121,12 @@ OnnxHqqQuantization
 GraphSurgeries
 --------------------
 .. autoconfigclass:: olive.passes.GraphSurgeries
+
+.. _nvmodelopt_graph_surgery:
+
+NVModelOptGraphSurgery
+----------------------
+.. autoconfigclass:: olive.passes.NVModelOptGraphSurgery
 
 .. _matmulnbits_to_qdq:
 
@@ -200,6 +212,13 @@ AimetQuantization
 -----------------
 
 .. autoconfigclass:: olive.passes.AimetQuantization
+
+.. _quark_quantization:
+
+QuarkQuantization
+-----------------
+
+.. autoconfigclass:: olive.passes.QuarkQuantization
 
 Pytorch
 =================================
@@ -312,12 +331,6 @@ AutoAWQQuantizer
 Rtn
 ----------------
 .. autoconfigclass:: olive.passes.Rtn
-
-.. _torch_trt_conversion:
-
-TorchTRTConversion
-------------------
-.. autoconfigclass:: olive.passes.TorchTRTConversion
 
 OpenVINO
 =================================

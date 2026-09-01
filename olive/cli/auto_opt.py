@@ -2,6 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
+import logging
 from argparse import ArgumentParser
 from collections import OrderedDict
 from copy import deepcopy
@@ -14,6 +15,7 @@ from olive.cli.base import (
     add_logging_options,
     add_save_config_file_options,
     add_shared_cache_options,
+    add_telemetry_options,
     get_input_model_config,
     update_accelerator_options,
     update_shared_cache_options,
@@ -22,6 +24,9 @@ from olive.common.utils import set_nested_dict_value
 from olive.constants import Precision
 from olive.hardware.constants import ExecutionProvider
 from olive.package_config import OlivePackageConfig
+from olive.telemetry import action
+
+logger = logging.getLogger(__name__)
 
 
 class AutoOptCommand(BaseOliveCLICommand):
@@ -29,7 +34,11 @@ class AutoOptCommand(BaseOliveCLICommand):
     def register_subcommand(parser: ArgumentParser):
         sub_parser = parser.add_parser(
             "auto-opt",
-            help="Automatically optimize the performance of the input model.",
+            help=(
+                "Automatically optimize the performance of the input model.\n"
+                "**** DEPRECATION WARNING ****\n"
+                '"auto-opt" command is deprecated in favor of "optimize".'
+            ),
         )
 
         # Model options
@@ -167,9 +176,16 @@ class AutoOptCommand(BaseOliveCLICommand):
         add_shared_cache_options(sub_parser)
         add_logging_options(sub_parser)
         add_save_config_file_options(sub_parser)
+        add_telemetry_options(sub_parser)
         sub_parser.set_defaults(func=AutoOptCommand)
 
+    @action
     def run(self):
+        logger.warning(
+            "**** DEPRECATION WARNING ****\n"
+            '"auto-opt" command is deprecated in favor of "optimize". Please switch to using "optimize".\n'
+            "Deprecated commands will be removed entirely in future release."
+        )
         return self._run_workflow()
 
     def _get_run_config(self, tempdir) -> dict:

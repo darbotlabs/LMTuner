@@ -9,8 +9,9 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Optional, Union, get_args
 
+from pydantic import BaseModel, ValidationError, create_model
+
 from olive.common.config_utils import ParamCategory, validate_config
-from olive.common.pydantic_v1 import BaseModel, ValidationError, create_model
 from olive.common.user_module_loader import UserModuleLoader
 from olive.data.config import DataConfig
 from olive.hardware import DEFAULT_CPU_ACCELERATOR, AcceleratorSpec
@@ -137,7 +138,7 @@ class Pass(ABC):
         assert set(point.keys()).intersection(set(search_params.keys())) == point.keys(), (
             "Search point is not in the search space."
         )
-        return config_class.parse_obj({**fixed_values, **search_params, **point})
+        return config_class.model_validate({**fixed_values, **search_params, **point})
 
     @classmethod
     def _identify_search_values(
@@ -244,7 +245,7 @@ class Pass(ABC):
         # assumption: the model attributes from passes, if any, are more important than
         # the input model attributes, we should not update/extend anymore outside of the pass run
         output_model.model_attributes = output_model.model_attributes or model.model_attributes
-        # save and carry forward additional files into the the output model path
+        # save and carry forward additional files into the output model path
         Pass._carry_forward_additional_files(model, output_model)
         return output_model
 
@@ -286,7 +287,10 @@ class Pass(ABC):
             output_filepath = output_model_path / input_filepath.name
             if not output_filepath.exists():
                 # TODO(team): Use symlinks instead of copying the files.
-                shutil.copy(str(input_filepath), str(output_filepath))
+                if input_filepath.is_dir():
+                    shutil.copytree(str(input_filepath), str(output_filepath))
+                else:
+                    shutil.copy(str(input_filepath), str(output_filepath))
             # always add the file_path to the output model's additional files
             # this covers the case where the output model_path is the same as the input model_path
             # like for perf-tuning pass
@@ -449,7 +453,7 @@ class Pass(ABC):
         default_config: dict[str, PassConfigParam],
     ) -> dict[str, Any]:
         """Resolve config to BasePassConfig."""
-        config = input_config.dict()
+        config = input_config.model_dump()
         config = cls._resolve_defaults(config, default_config)
         if "user_script" in config:
             user_module_loader = UserModuleLoader(config["user_script"], config["script_dir"])
@@ -474,7 +478,7 @@ class FullPassConfig(AbstractPassConfig):
     reconstruct the pass from the JSON file.
     """
 
-    accelerator: dict[str, str] = None
+    accelerator: Optional[dict[str, str]] = None
     host_device: Optional[str] = None
 
     def create_pass(self):
@@ -491,9 +495,9 @@ class FullPassConfig(AbstractPassConfig):
 # instead of using the default argument.
 def create_pass_from_dict(
     pass_cls: type[Pass],
-    config: dict[str, Any] = None,
+    config: Optional[dict[str, Any]] = None,
     disable_search=False,
-    accelerator_spec: AcceleratorSpec = None,
+    accelerator_spec: Optional[AcceleratorSpec] = None,
     host_device=None,
 ) -> Pass:
     """Create a pass from a dictionary."""

@@ -3,7 +3,7 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 from abc import ABC, abstractmethod
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 from olive.common.utils import StrEnumBase, flatten_dict, unflatten_dict
 
@@ -52,10 +52,10 @@ class Categorical(SearchParameter):
 
     """
 
-    def __init__(self, support: Union[list[str], list[int], list[float], list[bool]]):
+    def __init__(self, support: Union[list[str | None], list[int | None], list[float | None], list[bool | None]]):
         self.support = support
 
-    def get_support(self) -> Union[list[str], list[int], list[float], list[bool]]:
+    def get_support(self) -> Union[list[str | None], list[int | None], list[float | None], list[bool | None]]:
         """Get the support for the search parameter."""
         return self.support
 
@@ -119,7 +119,7 @@ class Conditional(SearchParameter):
         self,
         parents: tuple[str],
         support: dict[tuple[Any], SearchParameter],
-        default: SearchParameter = None,
+        default: Optional[SearchParameter] = None,
     ):
         assert isinstance(parents, tuple), "parents must be a tuple"
         for key in support:

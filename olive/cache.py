@@ -8,16 +8,19 @@ import logging
 import os
 import re
 import shutil
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from pydantic import Field, field_validator, model_validator
+
 from olive.common.config_utils import ConfigBase, convert_configs_to_dicts, validate_config
 from olive.common.constants import DEFAULT_CACHE_DIR, DEFAULT_WORKFLOW_ID
 from olive.common.container_client_factory import AzureContainerClientFactory
-from olive.common.pydantic_v1 import root_validator, validator
-from olive.common.utils import hash_dict, hf_repo_exists, set_nested_dict_value
+from olive.common.utils import hardlink_copy_file, hash_dict, hf_repo_exists, set_nested_dict_value
 from olive.model.config.model_config import ModelConfig
 from olive.resource_path import ResourcePath, create_resource_path, find_all_resources
 
@@ -27,6 +30,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SHARED_CACHE_PATTERN = r"https://([^.]+)\.blob\.core\.windows\.net/([^/]+)"
+_CACHE_DIR_CONTEXT: ContextVar[Optional[str]] = ContextVar("olive_cache_dir", default=None)
+_ISOLATED_CACHE_ENV: ContextVar[bool] = ContextVar("olive_isolated_cache_env", default=False)
+
+
+def get_cache_dir_from_env() -> Optional[str]:
+    """Get the cache directory from the current execution context or process environment."""
+    if _ISOLATED_CACHE_ENV.get():
+        return _CACHE_DIR_CONTEXT.get()
+    return os.environ.get("OLIVE_CACHE_DIR")
+
+
+@contextmanager
+def isolated_cache_env(cache_dir: Union[str, Path]):
+    """Scope the cache directory to the current context without changing the process environment."""
+    isolation_token = _ISOLATED_CACHE_ENV.set(True)
+    cache_dir_token = _CACHE_DIR_CONTEXT.set(str(cache_dir))
+    try:
+        yield
+    finally:
+        _CACHE_DIR_CONTEXT.reset(cache_dir_token)
+        _ISOLATED_CACHE_ENV.reset(isolation_token)
 
 
 def is_shared_cache_dir(s) -> bool:
@@ -53,15 +77,16 @@ class CacheSubDirs:
 
 
 class CacheConfig(ConfigBase):
-    cache_dir: Union[str, list[str]] = DEFAULT_CACHE_DIR
+    cache_dir: Union[str, list[str]] = Field(default=DEFAULT_CACHE_DIR, validate_default=True)
     clean_cache: bool = False
     clean_evaluation_cache: bool = False
-    account_name: str = None
-    container_name: str = None
+    account_name: Optional[str] = None
+    container_name: Optional[str] = None
     enable_shared_cache: bool = False
     update_shared_cache: bool = True
 
-    @validator("cache_dir", pre=True, always=True)
+    @field_validator("cache_dir", mode="before")
+    @classmethod
     def validate_cache_dir(cls, v):
         if not v:
             return [DEFAULT_CACHE_DIR]
@@ -85,30 +110,32 @@ class CacheConfig(ConfigBase):
             return [DEFAULT_CACHE_DIR, v]
         return [v]
 
-    @validator("account_name")
-    def validate_account_name(cls, v, values):
+    @field_validator("account_name")
+    @classmethod
+    def validate_account_name(cls, v, info):
         if v:
             return v
-        match = cls._get_shared_cache_match(values.get("cache_dir"))
+        match = cls._get_shared_cache_match(info.data.get("cache_dir"))
         return match.group(1) if match else None
 
-    @validator("container_name")
-    def validate_container_name(cls, v, values):
+    @field_validator("container_name")
+    @classmethod
+    def validate_container_name(cls, v, info):
         if v:
             return v
-        match = cls._get_shared_cache_match(values.get("cache_dir"))
+        match = cls._get_shared_cache_match(info.data.get("cache_dir"))
         return match.group(2) if match else None
 
-    @root_validator()
-    def validate_enable_shared_cache(cls, values):
-        if values.get("account_name") and values.get("container_name"):
-            values["enable_shared_cache"] = True
-        elif values.get("enable_shared_cache"):
-            values["account_name"] = values.get("account_name") or "olivepublicmodels"
-            values["container_name"] = values.get("container_name") or "olivecachemodels"
+    @model_validator(mode="after")
+    def validate_enable_shared_cache(self):  # noqa: N804  # model_validator mode="after" uses self
+        if self.account_name and self.container_name:
+            self.enable_shared_cache = True
+        elif self.enable_shared_cache:
+            self.account_name = self.account_name or "olivepublicmodels"
+            self.container_name = self.container_name or "olivecachemodels"
         else:
-            values["enable_shared_cache"] = False
-        return values
+            self.enable_shared_cache = False
+        return self
 
     @staticmethod
     def _get_shared_cache_match(cache_dir):
@@ -168,7 +195,7 @@ class OliveCache:
     @classmethod
     def from_cache_env(cls) -> "OliveCache":
         """Create an OliveCache object from the cache directory environment variable."""
-        cache_dir = os.environ.get("OLIVE_CACHE_DIR")
+        cache_dir = get_cache_dir_from_env()
         if cache_dir is None:
             logger.debug("OLIVE_CACHE_DIR environment variable not set. Using default cache directory.")
             cache_dir = Path(DEFAULT_CACHE_DIR).resolve() / DEFAULT_WORKFLOW_ID
@@ -280,7 +307,7 @@ class OliveCache:
         pass_name: str,
         pass_config: dict[str, Any],
         input_model_id: str,
-        accelerator_spec: "AcceleratorSpec" = None,
+        accelerator_spec: Optional["AcceleratorSpec"] = None,
     ):
         run_json = self.get_run_json(pass_name.lower(), pass_config, input_model_id, accelerator_spec)
         return hash_dict(run_json)[:8]
@@ -291,7 +318,11 @@ class OliveCache:
 
     def set_cache_env(self):
         """Set environment variable for the cache directory."""
-        os.environ["OLIVE_CACHE_DIR"] = str(self.dirs.cache_dir)
+        cache_dir = str(self.dirs.cache_dir)
+        if _ISOLATED_CACHE_ENV.get():
+            _CACHE_DIR_CONTEXT.set(cache_dir)
+        else:
+            os.environ["OLIVE_CACHE_DIR"] = cache_dir
         logger.debug("Set OLIVE_CACHE_DIR: %s", self.dirs.cache_dir)
 
     def prepare_resources_for_local(self, config: Union[dict, ConfigBase]) -> Union[dict, ConfigBase]:
@@ -380,10 +411,10 @@ class OliveCache:
     ):
         """Save a model from the cache to a given path."""
         output_dir = Path(output_dir) if output_dir else Path.cwd()
-
-        # If output_dir has a suffix (like .onnx), it's a file path
-        # Use parent directory for saving files
-        actual_output_dir = output_dir.parent if output_dir.suffix else output_dir
+        if output_dir.suffix and not output_dir.is_dir():
+            actual_output_dir = output_dir.parent
+        else:
+            actual_output_dir = output_dir
         actual_output_dir.mkdir(parents=True, exist_ok=True)
 
         model_json = self.load_model(model_id)
@@ -392,22 +423,122 @@ class OliveCache:
             model_attributes = model_json_config.get("model_attributes") or {}
 
             if model_attributes.get("no_flatten"):
-                # Preserve directory structure (e.g., for diffusers models exported by optimum)
+                # Preserve directory structure for packages whose components live
+                # in separate subdirectories under a shared root.
                 source_path = Path(model_json_config["model_path"])
+                source_path_resolved = source_path.resolve()
                 if source_path.exists():
                     shutil.copytree(source_path, actual_output_dir, dirs_exist_ok=overwrite)
 
-                # Update component paths to point to new location
+                def _rebase_additional_files(config: dict, fallback_dir: Path):
+                    model_attributes = config.get("model_attributes") or {}
+                    additional_files = model_attributes.get("additional_files") or []
+                    if not additional_files:
+                        return
+
+                    rebased_additional_files = []
+                    for additional_file in additional_files:
+                        source_additional_file = Path(additional_file)
+                        try:
+                            relative = source_additional_file.resolve().relative_to(source_path_resolved)
+                            output_additional_file = actual_output_dir / relative
+                        except ValueError:
+                            output_additional_file = fallback_dir / source_additional_file.name
+                            if source_additional_file.exists() and not output_additional_file.exists():
+                                output_additional_file.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(source_additional_file, output_additional_file)
+                        rebased_additional_files.append(str(output_additional_file))
+
+                    model_attributes["additional_files"] = rebased_additional_files
+                    config["model_attributes"] = model_attributes
+
+                # Rewrite each component's model_path so it points into the
+                # new output location while preserving the component's
+                # relative position underneath the package root. Without
+                # rebasing component paths the saved model_config.json
+                # cannot be loaded (and onnx_file_name is left untouched,
+                # so we must not collapse component subdirs into the root).
+                _rebase_additional_files(model_json_config, actual_output_dir)
                 for component in model_json_config["model_components"]:
-                    component["config"]["model_path"] = str(actual_output_dir)
+                    component_config = component["config"]
+                    component_model_path = component_config.get("model_path")
+                    if component_model_path:
+                        try:
+                            relative = Path(component_model_path).resolve().relative_to(source_path_resolved)
+                        except ValueError:
+                            # Component path is not under the composite root;
+                            # fall back to placing it at the package root.
+                            relative = Path()
+                        component_config["model_path"] = str(actual_output_dir / relative)
+                    else:
+                        component_config["model_path"] = str(actual_output_dir)
+                    _rebase_additional_files(component_config, Path(component_config["model_path"]))
                 model_json_config["model_path"] = str(actual_output_dir)
             else:
                 copied_components = []
                 saved_external_files = {}
+
+                # replace resources with their local cache paths once per component so the same
+                # resolved model json/paths can be used both to detect shared external-data files
+                # (below) and to actually copy the components (further below)
+                processed_components = []
                 for component_name, component in zip(
                     model_json_config["model_component_names"], model_json_config["model_components"]
                 ):
                     if component["type"].lower() != "onnxmodel":
+                        processed_components.append((component_name, component, None, None))
+                    else:
+                        component_model_json, component_local_resource_names = self._replace_with_local_resources(
+                            component, only_cache_files=only_cache_files
+                        )
+                        processed_components.append(
+                            (component_name, component, component_model_json, component_local_resource_names)
+                        )
+
+                # onnx components of a composite model can share a single external-data file (e.g.
+                # QNN GPU static LLM prefill/decode models reusing one model.onnx.data). Detect
+                # that sharing upfront and reserve+copy the original file name for it, so it keeps
+                # that name in the output folder instead of being renamed after whichever component
+                # happens to be processed first. Opt-in via model_attributes so this scan only runs
+                # for passes that are known to rely on it (currently QNN GPU StaticLLM).
+                if model_attributes.get("keep_shared_external_data_names"):
+                    from olive.passes.onnx.common import get_external_data_file_names
+
+                    external_file_usage: dict[str, int] = {}
+                    for _, _, component_model_json, _ in processed_components:
+                        if component_model_json is None:
+                            continue
+                        component_model_path = (
+                            ModelConfig.model_validate(component_model_json).create_model().model_path
+                        )
+                        if not component_model_path or not Path(component_model_path).is_file():
+                            continue
+                        for external_name in get_external_data_file_names(component_model_path):
+                            external_file_path = str(Path(component_model_path).parent / external_name)
+                            external_file_usage[external_file_path] = external_file_usage.get(external_file_path, 0) + 1
+
+                    reserved_external_names = set()
+                    for external_file_path, usage_count in external_file_usage.items():
+                        if usage_count <= 1:
+                            continue
+                        original_name = Path(external_file_path).name
+                        if original_name in reserved_external_names:
+                            continue
+                        # resave_model only copies an external-data file the first time it sees its
+                        # source path; since we're deciding the target name ahead of that, copy it here
+                        # so the file actually exists once resave_model reuses this reserved name.
+                        actual_output_dir.mkdir(parents=True, exist_ok=True)
+                        hardlink_copy_file(external_file_path, actual_output_dir / original_name, follow_symlinks=True)
+                        saved_external_files[external_file_path] = original_name
+                        reserved_external_names.add(original_name)
+
+                for (
+                    component_name,
+                    component,
+                    component_model_json,
+                    component_local_resource_names,
+                ) in processed_components:
+                    if component_model_json is None:
                         # save each component with a prefix
                         # e.g. "component_1" -> "component_1_{resource_name}"
                         copied_components.append(
@@ -421,10 +552,6 @@ class OliveCache:
                         )
                     else:
                         # save all onnx files into the same directory
-                        component_model_json, component_local_resource_names = self._replace_with_local_resources(
-                            component, only_cache_files=only_cache_files
-                        )
-
                         for resource_name in component_local_resource_names:
                             if resource_name != "model_path":
                                 # this case does not exist in the current code
@@ -435,13 +562,19 @@ class OliveCache:
                             else:
                                 from olive.passes.onnx.common import resave_model
 
+                                component_output_name = (
+                                    component_name
+                                    if Path(component_name).suffix == ".onnx"
+                                    else f"{component_name}.onnx"
+                                )
+
                                 resave_model(
-                                    ModelConfig.parse_obj(component_model_json).create_model().model_path,
-                                    actual_output_dir / f"{component_name}.onnx",
+                                    ModelConfig.model_validate(component_model_json).create_model().model_path,
+                                    actual_output_dir / component_output_name,
                                     saved_external_files=saved_external_files,
                                 )
                                 component_model_json["config"][resource_name] = str(actual_output_dir)
-                                component_model_json["config"]["onnx_file_name"] = f"{component_name}.onnx"
+                                component_model_json["config"]["onnx_file_name"] = component_output_name
 
                         copied_components.append(component_model_json)
 
@@ -462,7 +595,7 @@ class OliveCache:
         output_dir: str,
         overwrite: bool = False,
         only_cache_files: bool = False,
-        path_prefix: str = None,
+        path_prefix: Optional[str] = None,
     ) -> dict:
         # get updated model json with local resources
         model_json, local_resource_names = self._replace_with_local_resources(
@@ -488,9 +621,11 @@ class OliveCache:
                 output_file = output_dir
                 actual_output_dir = output_dir.parent
             else:
-                # Otherwise, create model.onnx in the directory
+                # Otherwise, create model.onnx in the directory.
+                # Preserve the source onnx_file_name stem (e.g. model_ctx) so the output
+                # filename matches what genai_config.json references.
                 actual_output_dir = output_dir
-                model_file_name = "model"
+                model_file_name = Path(onnx_file_name).stem if has_additional_files and onnx_file_name else "model"
                 if path_prefix:
                     model_file_name = f"{path_prefix}_{model_file_name}"
                 output_file = output_dir / f"{model_file_name}.onnx"
@@ -730,7 +865,7 @@ class SharedCache:
                     model_id,
                 )
 
-    def load_model(self, model_id: str, model_json_path: Path) -> ModelConfig:
+    def load_model(self, model_id: str, model_json_path: Path) -> Optional[ModelConfig]:
         """Get model config from shared cache by model id."""
         model_config_blob = f"{model_id}/model.json"
 
@@ -842,7 +977,7 @@ class SharedCache:
             self.container_client_factory.upload_blob(blob_name, data)
 
     def _download_blob_list(
-        self, blob_list, directory_prefix: str, output_model_path: Path, prefix: str = None
+        self, blob_list, directory_prefix: str, output_model_path: Path, prefix: Optional[str] = None
     ) -> None:
         for blob in blob_list:
             local_file_path = (

@@ -3,7 +3,6 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 
-# ruff: noqa: T201
 
 from argparse import ArgumentParser, Namespace
 from collections import OrderedDict
@@ -15,11 +14,13 @@ from olive.cli.base import (
     add_input_model_options,
     add_logging_options,
     add_save_config_file_options,
+    add_telemetry_options,
     get_input_model_config,
 )
 from olive.common.utils import set_nested_dict_value
 from olive.constants import Precision, precision_bits_from_precision
 from olive.hardware.constants import ExecutionProvider
+from olive.telemetry import action
 
 
 class OptimizeCommand(BaseOliveCLICommand):
@@ -184,11 +185,12 @@ class OptimizeCommand(BaseOliveCLICommand):
 
         add_logging_options(sub_parser)
         add_save_config_file_options(sub_parser)
+        add_telemetry_options(sub_parser)
         sub_parser.set_defaults(func=OptimizeCommand)
 
     def __init__(self, parser: ArgumentParser, args: Namespace, unknown_args: Optional[list] = None):
         super().__init__(parser, args, unknown_args)
-        self.need_wikitest_data_config = False
+        self.need_wikitext_data_config = False
         self.is_hf_model = False  # will be set in _get_run_config
 
         # Pass enabled flags
@@ -199,7 +201,6 @@ class OptimizeCommand(BaseOliveCLICommand):
         self.enable_onnx_conversion = False
         self.enable_optimum_openvino_conversion = False
         self.enable_dynamic_to_fixed_shape = False
-        self.enable_vitis_ai_preprocess = False
         self.enable_onnx_io_datatype_converter = False
         self.enable_openvino_io_update = False
         self.enable_onnx_peephole_optimizer = False
@@ -216,6 +217,7 @@ class OptimizeCommand(BaseOliveCLICommand):
         self.enable_compose_onnx_models = False
         self.enable_openvino_encapsulation = False
 
+    @action
     def run(self):
         return self._run_workflow()
 
@@ -291,6 +293,19 @@ class OptimizeCommand(BaseOliveCLICommand):
         """Update system configuration based on provider and device."""
         provider = ExecutionProvider(self.args.provider)
 
+        accelerator = {"execution_providers": [provider.value]}
+        if self.args.device:
+            accelerator["device"] = self.args.device
+        if self.args.memory is not None:
+            accelerator["memory"] = self.args.memory
+
+        config["systems"]["local_system"] = {
+            "type": "LocalSystem",
+            "accelerators": [accelerator],
+        }
+
+        config["target"] = "local_system"
+
         if provider == ExecutionProvider.QNNExecutionProvider and self.args.enable_aot:
             config["systems"]["qnn_system"] = {
                 "type": "PythonEnvironment",
@@ -300,7 +315,7 @@ class OptimizeCommand(BaseOliveCLICommand):
             config["target"] = "qnn_system"
 
     def _add_data_config(self, config: dict[str, Any]):
-        config["data_configs"] = WIKITEXT2_DATA_CONFIG_TEMPLATE if self.need_wikitest_data_config else []
+        config["data_configs"] = WIKITEXT2_DATA_CONFIG_TEMPLATE if self.need_wikitext_data_config else []
 
     def _build_passes_config(self) -> dict[str, Any]:
         passes_config = OrderedDict()
@@ -549,7 +564,7 @@ class OptimizeCommand(BaseOliveCLICommand):
 
     def _enable_onnx_peephole_optimizer_pass(self) -> bool:
         """Return true if condition to add OnnxPeepholeOptimizer pass is met."""
-        return self.args.exporter != "model_builder"
+        return not self.is_hf_model or self.args.exporter != "model_builder"
 
     def _get_onnx_peephole_optimizer_pass_config(self) -> dict[str, Any]:
         """Return pass dictionary for OnnxPeepholeOptimizer pass."""
@@ -579,7 +594,7 @@ class OptimizeCommand(BaseOliveCLICommand):
             "add_zero_point": "true",
             "save_as_external_data": "true",
         }
-        config["nodes_to_exclude"] = ["/lm_head/MatMul_Q4"]
+        config["nodes_to_exclude"] = ["/lm_head/MatMulNBits", "/lm_head/MatMul_Q4"]
         if precision.value == Precision.INT4:
             config["use_int4"] = "true"
         return config
@@ -619,7 +634,7 @@ class OptimizeCommand(BaseOliveCLICommand):
     def _enable_onnx_float_to_float16_pass(self) -> bool:
         """Return true if condition to add OnnxFloatToFloat16 pass is met."""
         precision = Precision(self.args.precision)
-        return precision == Precision.FP16
+        return precision == Precision.FP16 and not self.enable_model_builder
 
     def _get_onnx_float_to_float16_pass_config(self) -> dict[str, Any]:
         """Return pass dictionary for OnnxFloatToFloat16 pass."""
@@ -664,7 +679,7 @@ class OptimizeCommand(BaseOliveCLICommand):
 
         # Add data_config for text modality
         if self.args.modality == "text":
-            self.need_wikitest_data_config = True
+            self.need_wikitext_data_config = True
             config["data_config"] = "wikitext2_train"
 
         return config
@@ -762,13 +777,15 @@ class OptimizeCommand(BaseOliveCLICommand):
 
     def _get_openvino_encapsulation_pass_config(self) -> dict[str, Any]:
         """Return pass dictionary for OpenVINOEncapsulation pass."""
-        return {
+        config = {
             "type": "OpenVINOEncapsulation",
-            "target_device": self.args.device,
             "keep_ov_dynamic_shapes": True,
             "op_version": "2025.1",
             "reuse_cache": True,
         }
+        if self.args.device is not None:
+            config["target_device"] = self.args.device
+        return config
 
     def _enable_onnx_io_datatype_converter_pass(self) -> bool:
         """Return true if condition to add OnnxIODataTypeConverter pass is met."""

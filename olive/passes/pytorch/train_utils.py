@@ -5,15 +5,15 @@
 import dataclasses
 import logging
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union
 
 import torch
 import transformers
 from packaging import version
+from pydantic import Field, field_validator
 from transformers import __version__ as transformers_version
 
 from olive.common.config_utils import NestedConfig, validate_config
-from olive.common.pydantic_v1 import Field, validator
 from olive.common.utils import cleanup_memory
 from olive.data.config import DataConfig
 from olive.data.template import huggingface_data_config_template
@@ -33,30 +33,34 @@ if TYPE_CHECKING:
 class BaseHFTrainingArguments(NestedConfig):
     """Training arguments for transformers.Trainer."""
 
-    _nested_field_name = "extra_args"
+    _nested_field_name: ClassVar[str] = "extra_args"
 
     gradient_checkpointing: bool = Field(True, description="Use gradient checkpointing. Recommended.")
     report_to: Union[str, list[str]] = Field(
         "none", description="The list of integrations to report the results and logs to."
     )
-    output_dir: str = Field(None, description="The output dir for logs and checkpoints. If None, will use a temp dir.")
-    deepspeed: Union[bool, str, dict] = Field(
+    output_dir: Optional[str] = Field(
+        None, description="The output dir for logs and checkpoints. If None, will use a temp dir."
+    )
+    deepspeed: Optional[Union[bool, str, dict]] = Field(
         None,
         description=(
             "Use [Deepspeed](https://github.com/microsoft/deepspeed). If True, will use default deepspeed config. Else,"
             " it is a path to a deepspeed config file or a dict with deepspeed config."
         ),
     )
-    extra_args: dict[str, Any] = Field(
+    extra_args: Optional[dict[str, Any]] = Field(
         None,
         description=(
             "Extra arguments to pass to the trainer. Values can be provided directly to this field as a dict or as"
             " keyword arguments to the config. See transformers.TrainingArguments for more details on the available"
             " arguments."
         ),
+        validate_default=True,
     )
 
-    @validator("extra_args", pre=True, always=True)
+    @field_validator("extra_args", mode="before")
+    @classmethod
     def validate_extra_args(cls, v):
         if v is None:
             v = {}
@@ -69,7 +73,7 @@ class BaseHFTrainingArguments(NestedConfig):
         return v
 
     def create_training_args(self) -> transformers.TrainingArguments:
-        args = self.dict()
+        args = self.model_dump()
         if not args["output_dir"]:
             raise ValueError("output_dir must be provided.")
         if args["deepspeed"] is True:
@@ -79,6 +83,11 @@ class BaseHFTrainingArguments(NestedConfig):
         if version.parse(transformers_version) < version.parse("4.41") and "eval_strategy" in args:
             args["evaluation_strategy"] = args.pop("eval_strategy")
         extra_args = args.pop("extra_args")
+        # Filter out fields that are not valid TrainingArguments parameters (e.g. overwrite_output_dir
+        # was removed in transformers 5.0 but is still used by Olive's own logic) and None values
+        # so that transformers uses its own defaults
+        training_args_fields = {f.name for f in dataclasses.fields(transformers.TrainingArguments) if f.init}
+        args = {k: v for k, v in args.items() if k in training_args_fields and v is not None}
         return transformers.TrainingArguments(**args, **extra_args)
 
 
@@ -111,7 +120,7 @@ def load_hf_base_model(
     new_model_handler = deepcopy(model_handler)
 
     # load model, reset load_kwargs and adapter_path
-    load_kwargs = new_model_handler.load_kwargs.dict() if new_model_handler.load_kwargs else {}
+    load_kwargs = new_model_handler.load_kwargs.model_dump() if new_model_handler.load_kwargs else {}
     load_kwargs.update(
         {
             # use "auto" as default to use the dtype from the model config
@@ -246,7 +255,7 @@ DEFAULT_DEEPSPEED_CONFIG = {
 def get_calibration_dataset(
     model: HfModelHandler | PyTorchModelHandler,
     data_config: DataConfig | dict | None = None,
-    split: str = "train[:1000]",
+    split: str = "train",
     batch_size: int = 1,
     max_seq_len: int = 2048,
     max_samples: int = 128,
@@ -256,7 +265,7 @@ def get_calibration_dataset(
     Args:
         model: The HuggingFace or PyTorch model to get dataset for.
         data_config: Configuration object or dictionary containing data settings.
-        split: The dataset split to use for default data config. Default is 'train[:1000]'.
+        split: The dataset split to use for default data config. Default is 'train'.
         batch_size: The batch size to use for default data config. Default is 1.
         max_seq_len: Maximum sequence length for default data config. Default is 2048.
         max_samples: Maximum number of samples for default data config. Default is 128.
@@ -271,7 +280,7 @@ def get_calibration_dataset(
     if not data_config and isinstance(model, HfModelHandler):
         data_config = get_calibration_data_config(
             model.model_name_or_path,
-            trust_remote_code=model.get_load_kwargs().get("trust_remote_code", None),
+            trust_remote_code=model.get_load_kwargs().get("trust_remote_code", False),
             split=split,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
@@ -300,8 +309,10 @@ def get_calibration_dataset(
 
 def get_calibration_data_config(
     model_name_or_path: str,
-    trust_remote_code: bool | None = None,
-    split: str = "train[:1000]",
+    trust_remote_code: bool = False,
+    data_name: str = "Salesforce/wikitext",
+    subset: str = "wikitext-2-raw-v1",
+    split: str = "train",
     batch_size: int = 1,
     max_seq_len: int = 2048,
     max_samples: int = 128,
@@ -311,7 +322,9 @@ def get_calibration_data_config(
     Args:
         model_name_or_path: Name or path of the model.
         trust_remote_code: Whether to trust remote code when loading data.
-        split: The dataset split to use. Default is 'train[:1000]'.
+        data_name: The name of the dataset to use from Hugging Face Datasets. Default is "Salesforce/wikitext".
+        subset: The subset of the dataset to use. Default is "wikitext-2-raw-v1".
+        split: The dataset split to use. Default is 'train'.
         batch_size: The batch size to use. Default is 1.
         max_seq_len: Maximum sequence length. Default is 2048.
         max_samples: Maximum number of samples. Default is 128.
@@ -324,8 +337,8 @@ def get_calibration_data_config(
         model_name=model_name_or_path,
         task="text-generation",
         load_dataset_config={
-            "data_name": "Salesforce/wikitext",
-            "subset": "wikitext-2-raw-v1",
+            "data_name": data_name,
+            "subset": subset,
             "split": split,
             "trust_remote_code": trust_remote_code,
         },

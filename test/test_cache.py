@@ -3,19 +3,48 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 import json
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import ANY, mock_open, patch
 
 import pytest
 
-from olive.cache import CacheConfig, OliveCache, SharedCache
+from olive.cache import CacheConfig, OliveCache, SharedCache, isolated_cache_env
 from olive.common.constants import DEFAULT_WORKFLOW_ID
+from olive.systems.utils import create_new_environ
 
 # pylint: disable=W0201
 
 
 class TestCache:
+    def test_cache_env_is_scoped_to_parallel_build_thread(self, tmp_path, monkeypatch):
+        barrier = Barrier(2)
+        process_cache_dir = tmp_path / "process"
+        monkeypatch.setenv("OLIVE_CACHE_DIR", str(process_cache_dir))
+
+        def set_and_read_cache(cache_dir):
+            with isolated_cache_env(cache_dir):
+                cache = OliveCache({"cache_dir": cache_dir})
+                cache.set_cache_env()
+                barrier.wait(timeout=2)
+                return (
+                    OliveCache.from_cache_env().get_cache_dir(),
+                    Path(create_new_environ()["OLIVE_CACHE_DIR"]),
+                    Path(os.environ["OLIVE_CACHE_DIR"]),
+                )
+
+        cache_dirs = [tmp_path / "first", tmp_path / "second"]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            resolved = list(executor.map(set_and_read_cache, cache_dirs))
+
+        assert [item[0] for item in resolved] == [path.resolve() for path in cache_dirs]
+        assert [item[1] for item in resolved] == cache_dirs
+        assert all(item[2] == process_cache_dir for item in resolved)
+        assert Path(os.environ["OLIVE_CACHE_DIR"]) == process_cache_dir
+
     @pytest.mark.parametrize("clean_cache", [True, False])
     def test_cache_init(self, clean_cache, tmp_path):
         # setup
@@ -349,6 +378,73 @@ class TestCache:
         assert output_json_path.exists()
         with open(output_json_path) as f:
             assert expected_output_path == json.load(f)["config"]["model_path"]
+
+    def test_save_model_no_flatten_rebases_component_and_additional_file_paths(self, tmp_path):
+        # setup
+        model_id = "composite_model"
+        cache = CacheConfig(cache_dir=tmp_path / "cache").create_cache()
+
+        source_dir = tmp_path / "source_model"
+        decoder_dir = source_dir / "decoder"
+        embedding_dir = source_dir / "embedding"
+        decoder_dir.mkdir(parents=True, exist_ok=True)
+        embedding_dir.mkdir(parents=True, exist_ok=True)
+        (decoder_dir / "model.onnx").write_text("decoder")
+        (embedding_dir / "model.onnx").write_text("embedding")
+        (decoder_dir / "decoder_local.txt").write_text("decoder local")
+        (source_dir / "genai_config.json").write_text("{}")
+        (source_dir / "tokenizer.json").write_text("{}")
+
+        model_json = {
+            "type": "compositemodel",
+            "config": {
+                "model_path": str(source_dir),
+                "model_component_names": ["decoder", "embedding"],
+                "model_components": [
+                    {
+                        "type": "onnxmodel",
+                        "config": {
+                            "model_path": str(decoder_dir),
+                            "onnx_file_name": "model.onnx",
+                            "model_attributes": {"additional_files": [str(decoder_dir / "decoder_local.txt")]},
+                        },
+                    },
+                    {
+                        "type": "onnxmodel",
+                        "config": {"model_path": str(embedding_dir), "onnx_file_name": "model.onnx"},
+                    },
+                ],
+                "model_attributes": {
+                    "no_flatten": True,
+                    "additional_files": [str(source_dir / "genai_config.json"), str(source_dir / "tokenizer.json")],
+                },
+            },
+        }
+        with cache.get_model_json_path(model_id).open("w") as f:
+            json.dump(model_json, f)
+
+        output_dir = tmp_path / "output"
+        output_json = cache.save_model(model_id, output_dir, True)
+
+        # assert copied layout
+        assert (output_dir / "decoder" / "model.onnx").exists()
+        assert (output_dir / "embedding" / "model.onnx").exists()
+        assert (output_dir / "genai_config.json").exists()
+        assert (output_dir / "tokenizer.json").exists()
+
+        # assert rewritten config paths
+        assert output_json["config"]["model_path"] == str(output_dir)
+        decoder_component = output_json["config"]["model_components"][0]["config"]
+        assert decoder_component["model_path"] == str(output_dir / "decoder")
+        assert decoder_component["onnx_file_name"] == "model.onnx"
+        assert decoder_component["model_attributes"]["additional_files"] == [
+            str(output_dir / "decoder" / "decoder_local.txt")
+        ]
+
+        assert output_json["config"]["model_attributes"]["additional_files"] == [
+            str(output_dir / "genai_config.json"),
+            str(output_dir / "tokenizer.json"),
+        ]
 
 
 class TestSharedCache:

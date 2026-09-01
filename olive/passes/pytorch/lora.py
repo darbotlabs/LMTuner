@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import transformers
 from packaging import version
+from pydantic import Field, field_validator
 
 from olive.common.hf.mappings import MODELS_TO_LORA_TARGET_MODULES_MAPPING
 from olive.common.hf.utils import get_peft_task_type_from_task
-from olive.common.pydantic_v1 import Field, validator
 from olive.common.utils import StrEnumBase, find_submodules, resolve_torch_dtype
 from olive.data.config import DataConfig
 from olive.data.constants import IGNORE_INDEX
@@ -67,7 +67,7 @@ class HFTrainingArguments(BaseHFTrainingArguments):
         description="Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis.",
     )
     warmup_ratio: float = Field(0.03, description="Fraction of steps to do a warmup for.")
-    eval_strategy: str = Field(
+    eval_strategy: Optional[str] = Field(
         None,
         description=(
             "The evaluation strategy to use. Forced to 'no' if eval_dataset is not provided. Otherwise, 'steps' unless"
@@ -81,14 +81,15 @@ class HFTrainingArguments(BaseHFTrainingArguments):
             " a checkpoint directory."
         ),
     )
-    resume_from_checkpoint: str = Field(
+    resume_from_checkpoint: Optional[str] = Field(
         None,
         description=(
             "The path to a folder with a valid checkpoint for the model. Supercedes any checkpoint found in output_dir."
         ),
     )
 
-    @validator("extra_args", pre=True, always=True)
+    @field_validator("extra_args", mode="before")
+    @classmethod
     def validate_torch_dtype(cls, v):
         if v and "fp16" in v:
             logger.warning("Extra arg 'fp16' is not allowed. Please use `torch_dtype` instead.")
@@ -444,7 +445,7 @@ class LoRA(Pass):
                 # use fp16 mixed precision training
                 config.training_args.extra_args["fp16"] = True
             # create training args
-            logger.debug("Training args: %s", config.training_args.dict())
+            logger.debug("Training args: %s", config.training_args.model_dump())
 
             # get trainer'
             trainer = transformers.Trainer(
@@ -503,7 +504,7 @@ class LoRA(Pass):
 
     @staticmethod
     def get_peft_model(
-        model: "PreTrainedModel", config: type[BasePassConfig], config_kwargs: dict = None
+        model: "PreTrainedModel", config: type[BasePassConfig], config_kwargs: Optional[dict] = None
     ) -> "PeftModel":
         """Get the PEFT model for LoRA fine-tuning."""
         from peft import LoraConfig, LoraRuntimeConfig, get_peft_model
@@ -534,68 +535,69 @@ class DoRA(LoRA):
         return self._run_lora_training(model, config, output_model_path, use_dora=True)
 
 
-class LoRAVariant(LoRA):
-    """Run LoRA variant fine-tuning on a Hugging Face PyTorch model."""
+def _lora_variant_config() -> dict[str, PassConfigParam]:
+    """Shared config params for LoRA variant passes (LoHa, LoKr)."""
+    return {
+        "rank_dropout": PassConfigParam(
+            type_=float,
+            default_value=0.0,
+            description="The dropout probability for rank dimension during training.",
+        ),
+        "module_dropout": PassConfigParam(
+            type_=float,
+            default_value=0.0,
+            description="The dropout probability for disabling modules during training.",
+        ),
+        "use_effective_conv2d": PassConfigParam(
+            type_=bool,
+            default_value=True,
+            description="Use parameter effective decomposition for Conv2d with ksize > 1.",
+        ),
+        "exclude_modules": PassConfigParam(
+            type_=Optional[Union[list[str], str]], default_value=None, description="Modules to exclude from tuning."
+        ),
+        "init_weights": PassConfigParam(
+            type_=bool, default_value=True, description="Whether to perform initialization of adapter weights."
+        ),
+        "layers_to_transform": PassConfigParam(
+            type_=list[int], default_value=None, description="The layer indices to transform."
+        ),
+        "layers_pattern": PassConfigParam(
+            type_=list[str],
+            default_value=None,
+            description="The layer pattern name, used only if layers_to_transform is different from None.",
+        ),
+        "rank_pattern": PassConfigParam(
+            type_=dict,
+            default_value={},
+            description=(
+                "The mapping from layer names or regexp expression "
+                "to ranks which are different from the default rank specified by r."
+            ),
+        ),
+        "alpha_pattern": PassConfigParam(
+            type_=dict,
+            default_value={},
+            description=(
+                "The mapping from layer names or regexp expression "
+                "to alphas which are different from the default alpha specified by alpha."
+            ),
+        ),
+    }
+
+
+class LoHa(LoRA):
+    """Run LoHa fine-tuning on a Hugging Face PyTorch model."""
 
     @classmethod
     def _default_config(cls, accelerator_spec: AcceleratorSpec) -> dict[str, PassConfigParam]:
-        config = {
-            "rank_dropout": PassConfigParam(
-                type_=float,
-                default_value=0.0,
-                description="The dropout probability for rank dimension during training.",
-            ),
-            "module_dropout": PassConfigParam(
-                type_=float,
-                default_value=0.0,
-                description="The dropout probability for disabling modules during training.",
-            ),
-            "use_effective_conv2d": PassConfigParam(
-                type_=bool,
-                default_value=True,
-                description="Use parameter effective decomposition for Conv2d with ksize > 1.",
-            ),
-            "exclude_modules": PassConfigParam(
-                type_=Optional[Union[list[str], str]], default_value=None, description="Modules to exclude from tuning."
-            ),
-            "init_weights": PassConfigParam(
-                type_=bool, default_value=True, description="Whether to perform initialization of adapter weights."
-            ),
-            "layers_to_transform": PassConfigParam(
-                type_=list[int], default_value=None, description="The layer indices to transform."
-            ),
-            "layers_pattern": PassConfigParam(
-                type_=list[str],
-                default_value=None,
-                description="The layer pattern name, used only if layers_to_transform is different from None.",
-            ),
-            "rank_pattern": PassConfigParam(
-                type_=dict,
-                default_value={},
-                description=(
-                    "The mapping from layer names or regexp expression "
-                    "to ranks which are different from the default rank specified by r."
-                ),
-            ),
-            "alpha_pattern": PassConfigParam(
-                type_=dict,
-                default_value={},
-                description=(
-                    "The mapping from layer names or regexp expression "
-                    "to alphas which are different from the default alpha specified by alpha."
-                ),
-            ),
-        }
+        config = _lora_variant_config()
         config.update(super()._default_config(accelerator_spec))
         return config
 
-
-class LoHa(LoRAVariant):
-    """Run LoHa fine-tuning on a Hugging Face PyTorch model."""
-
     @staticmethod
     def get_peft_model(
-        model: "PreTrainedModel", config: type[BasePassConfig], config_kwargs: dict = None
+        model: "PreTrainedModel", config: type[BasePassConfig], config_kwargs: Optional[dict] = None
     ) -> "PeftModel":
         """Get the PEFT model for LoHa fine-tuning."""
         from peft import LoHaConfig, get_peft_model
@@ -631,7 +633,7 @@ class LoHa(LoRAVariant):
             raise ImportError(f"Please install peft >= 0.7.0 to use {cls.__name__} pass.")
 
 
-class LoKr(LoRAVariant):
+class LoKr(LoRA):
     """Run LoKr fine-tuning on a Hugging Face PyTorch model."""
 
     @classmethod
@@ -653,12 +655,13 @@ class LoKr(LoRAVariant):
                 description="Whether to scale the rank dropout while training.",
             ),
         }
+        config.update(_lora_variant_config())
         config.update(super()._default_config(accelerator_spec))
         return config
 
     @staticmethod
     def get_peft_model(
-        model: "PreTrainedModel", config: type[BasePassConfig], config_kwargs: dict = None
+        model: "PreTrainedModel", config: type[BasePassConfig], config_kwargs: Optional[dict] = None
     ) -> "PeftModel":
         """Get the PEFT model for LoKr fine-tuning."""
         from peft import LoKrConfig, get_peft_model
@@ -759,7 +762,7 @@ class QLoRABase(LoRA):
             model, config, output_model_path
         )
         if config.save_quant_config:
-            load_kwargs = new_model_handler.load_kwargs.dict() if new_model_handler.load_kwargs else {}
+            load_kwargs = new_model_handler.load_kwargs.model_dump() if new_model_handler.load_kwargs else {}
             load_kwargs.update(bnb_quant_config)
             new_model_handler.load_kwargs = HfLoadKwargs(**load_kwargs)
             new_model_handler.model_attributes["quantized_modules"] = quantized_modules

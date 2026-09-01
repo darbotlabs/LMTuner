@@ -3,8 +3,6 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 
-# ruff: noqa: T201
-# ruff: noqa: RUF012
 
 from argparse import ArgumentParser
 from copy import deepcopy
@@ -17,6 +15,7 @@ from olive.cli.base import (
     add_logging_options,
     add_save_config_file_options,
     add_shared_cache_options,
+    add_telemetry_options,
     update_dataset_options,
     update_input_model_options,
     update_shared_cache_options,
@@ -24,6 +23,7 @@ from olive.cli.base import (
 from olive.common.utils import StrEnumBase, set_nested_dict_value
 from olive.constants import Precision, QuantAlgorithm, precision_bits_from_precision
 from olive.package_config import OlivePackageConfig
+from olive.telemetry import action
 
 
 class ImplName(StrEnumBase):
@@ -94,6 +94,7 @@ class QuantizeCommand(BaseOliveCLICommand):
         add_shared_cache_options(sub_parser)
         add_logging_options(sub_parser)
         add_save_config_file_options(sub_parser)
+        add_telemetry_options(sub_parser)
         sub_parser.set_defaults(func=QuantizeCommand)
 
     def _check_data_name_arg(self, pinfo):
@@ -210,6 +211,7 @@ class QuantizeCommand(BaseOliveCLICommand):
         self._customize_config(config)
         return config
 
+    @action
     def run(self):
         return self._run_workflow()
 

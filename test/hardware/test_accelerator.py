@@ -372,7 +372,7 @@ def test_normalize_accelerators(
 
     system_config = validate_config(system_config, SystemConfig)
     python_mock = None
-    has_accelerators = system_config.config.accelerators is not None
+    has_accelerators = system_config.config and system_config.config.accelerators is not None
     if system_config.type == SystemType.Local:
         get_available_providers_mock.return_value = available_providers
     elif system_config.type == SystemType.PythonEnvironment:
@@ -429,6 +429,17 @@ def test_normalize_accelerators(
             },
             ("npu", [ExecutionProvider.QNNExecutionProvider], 1e9),
         ),
+        (
+            {
+                "type": "LocalSystem",
+                "config": {
+                    "accelerators": [
+                        {"device": "gpu", "execution_providers": [ExecutionProvider.WebGpuExecutionProvider]}
+                    ]
+                },
+            },
+            ("gpu", [ExecutionProvider.WebGpuExecutionProvider]),
+        ),
     ],
 )
 def test_normalize_accelerators_skip_ep_check(system_config, expected_acc):
@@ -438,6 +449,26 @@ def test_normalize_accelerators_skip_ep_check(system_config, expected_acc):
     assert normalized_accs.config.accelerators[0].execution_providers == expected_acc[1]
     if len(expected_acc) == 3:
         assert normalized_accs.config.accelerators[0].memory == expected_acc[2]
+
+
+@patch("olive.systems.local.get_ort_available_providers")
+def test_normalize_accelerators_requires_runtime_webgpu_when_target_used(get_available_providers_mock):
+    system_config = validate_config(
+        {
+            "type": "LocalSystem",
+            "config": {
+                "accelerators": [{"device": "gpu", "execution_providers": [ExecutionProvider.WebGpuExecutionProvider]}]
+            },
+        },
+        SystemConfig,
+    )
+    get_available_providers_mock.return_value = [
+        ExecutionProvider.CUDAExecutionProvider,
+        ExecutionProvider.CPUExecutionProvider,
+    ]
+
+    with pytest.raises(ValueError, match="None of the execution providers"):
+        AcceleratorNormalizer(system_config, skip_supported_eps_check=False).normalize()
 
 
 @pytest.mark.parametrize(
@@ -543,19 +574,19 @@ def test_create_accelerator_without_ep(system_config, expected_acc_specs):
 
 def test_accelerator_config():
     # only device
-    acc_cfg1 = AcceleratorConfig.parse_obj({"device": "cpu"})
+    acc_cfg1 = AcceleratorConfig.model_validate({"device": "cpu"})
     assert acc_cfg1.execution_providers is None
     # only ep
-    acc_cfg2 = AcceleratorConfig.parse_obj({"execution_providers": [ExecutionProvider.CPUExecutionProvider]})
+    acc_cfg2 = AcceleratorConfig.model_validate({"execution_providers": [ExecutionProvider.CPUExecutionProvider]})
     assert acc_cfg2.device is None
     # neither device nor ep
     with pytest.raises(ValueError, match="Either device or execution_providers must be provided"):
-        _ = AcceleratorConfig.parse_obj({})
+        _ = AcceleratorConfig.model_validate({})
     # device and memory
-    acc_cfg3 = AcceleratorConfig.parse_obj({"device": "cpu", "memory": "1MB"})
+    acc_cfg3 = AcceleratorConfig.model_validate({"device": "cpu", "memory": "1MB"})
     assert acc_cfg3.memory == 1e6
     # with ep library path
-    acc_cfg4 = AcceleratorConfig.parse_obj(
+    acc_cfg4 = AcceleratorConfig.model_validate(
         {
             "device": "gpu",
             "execution_providers": [(ExecutionProvider.CUDAExecutionProvider, "onnxruntime_providers_cuda.dll")],
