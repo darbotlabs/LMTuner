@@ -1,0 +1,1109 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+/* Required for RTLD_DEEPBIND (a glibc extension) to be exposed by <dlfcn.h>.
+ * Must be defined before any system header is included. Harmless on non-glibc
+ * platforms. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+/**
+ * Node-API C addon for the Foundry Local JS SDK.
+ *
+ * Replaces the koffi FFI bridge with a lightweight native addon that
+ * dynamically loads the FoundryLocalCore shared library at runtime and
+ * exposes the following JavaScript-callable functions:
+ *
+ *   loadLibrary(corePath, depPaths?)  – load native libs, resolve symbols
+ *   executeCommand(cmd, dataJson)     – synchronous command execution
+ *   executeCommandAsync(cmd, dataJson) – async command execution (Promise)
+ *   executeCommandWithBinary(cmd, dataJson, binaryBuf) – with binary payload
+ *   executeCommandStreaming(cmd, dataJson, callback) – async + streaming
+ */
+
+#include <node_api.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+/* ── Platform-specific dynamic loading ─────────────────────────────────── */
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+  typedef HMODULE lib_handle_t;
+  /* Library loads on Windows go through open_lib_from_napi(), which uses
+   * LoadLibraryW. LoadLibraryA would mangle path bytes that lie outside
+   * the process's active ANSI code page and fail with ERROR_MOD_NOT_FOUND.
+   */
+  #define LIB_SYM(handle, sym) GetProcAddress(handle, sym)
+  #define LIB_CLOSE(handle)    FreeLibrary(handle)
+#else
+  #include <dlfcn.h>
+  typedef void* lib_handle_t;
+  #define LIB_SYM(handle, sym) dlsym(handle, sym)
+  #define LIB_CLOSE(handle)    dlclose(handle)
+#endif
+
+/* ── Native core structs (must match C# / Rust definitions) ───────────── */
+
+typedef struct {
+    const char* Command;
+    int32_t     CommandLength;
+    const char* Data;
+    int32_t     DataLength;
+} RequestBuffer;
+
+typedef struct {
+    void*   Data;
+    int32_t DataLength;
+    void*   Error;
+    int32_t ErrorLength;
+} ResponseBuffer;
+
+typedef struct {
+    const char* Command;
+    int32_t     CommandLength;
+    const char* Data;
+    int32_t     DataLength;
+    const void* BinaryData;
+    int32_t     BinaryDataLength;
+} StreamingRequestBuffer;
+
+typedef int32_t (*CallbackFn)(const void* data, int32_t length, void* userData);
+
+/* ── Native function pointer types ────────────────────────────────────── */
+
+typedef void (*ExecuteCommandFn)(
+    const RequestBuffer* request,
+    ResponseBuffer* response
+);
+
+typedef void (*ExecuteCommandWithCallbackFn)(
+    const RequestBuffer* request,
+    ResponseBuffer* response,
+    CallbackFn callback,
+    void* userData
+);
+
+typedef void (*ExecuteCommandWithBinaryFn)(
+    const StreamingRequestBuffer* request,
+    ResponseBuffer* response
+);
+
+/* ── Module state ─────────────────────────────────────────────────────── */
+
+static lib_handle_t g_core_lib = NULL;
+static lib_handle_t* g_dep_libs = NULL;
+static size_t g_dep_lib_count = 0;
+
+static ExecuteCommandFn g_execute_command = NULL;
+static ExecuteCommandWithCallbackFn g_execute_command_with_callback = NULL;
+static ExecuteCommandWithBinaryFn g_execute_command_with_binary = NULL;
+
+/* ── Platform-specific memory deallocation ────────────────────────────── */
+
+/*
+ * The .NET native core allocates response buffers with Marshal.AllocHGlobal:
+ *   - Unix:    malloc  → free with free()
+ *   - Windows: LocalAlloc → free with LocalFree()
+ */
+static void free_native_buffer(void* ptr) {
+    if (!ptr) return;
+#ifdef _WIN32
+    LocalFree(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+/* ── Helper: throw JS error from napi_status ──────────────────────────── */
+
+#define NAPI_CALL(env, call)                                      \
+    do {                                                          \
+        napi_status _status = (call);                             \
+        if (_status != napi_ok) {                                 \
+            const napi_extended_error_info* _err_info = NULL;     \
+            napi_get_last_error_info((env), &_err_info);          \
+            const char* _msg = (_err_info && _err_info->error_message) \
+                ? _err_info->error_message                        \
+                : "Unknown N-API error";                          \
+            napi_throw_error((env), NULL, _msg);                  \
+            return NULL;                                          \
+        }                                                         \
+    } while (0)
+
+/* Maximum string length we accept (guard against size_t → int32_t overflow) */
+#define MAX_STRING_LENGTH ((size_t)INT32_MAX)
+
+/* ── Helper: validate string length fits in int32_t ───────────────────── */
+
+static int check_string_length(napi_env env, size_t len, const char* param_name) {
+    if (len > MAX_STRING_LENGTH) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s exceeds maximum length (2GB)", param_name);
+        napi_throw_error(env, NULL, msg);
+        return 0; /* failure */
+    }
+    return 1; /* ok */
+}
+
+/* ── Helper: create a JS Error object and reject a deferred promise ──── */
+
+static void reject_with_error(napi_env env, napi_deferred deferred,
+                               const char* message) {
+    napi_value err_msg, err_obj;
+    napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &err_msg);
+    napi_create_error(env, NULL, err_msg, &err_obj);
+    napi_reject_deferred(env, deferred, err_obj);
+}
+
+/* ── Preload system OpenSSL with RTLD_DEEPBIND on Linux/glibc ─────────── */
+
+/*
+ * Why this exists:
+ *
+ * Node.js statically links its own copy of OpenSSL and exports those symbols
+ * globally (the Node binary is linked with --export-dynamic). When the
+ * NativeAOT-compiled core .so is later loaded, the .NET cryptography PAL pulls
+ * in the system libcrypto.so.3 / libssl.so.3 for HTTPS (SslStream, X509 chain
+ * validation, etc.). libcrypto is mapped with the loader's default flags, so
+ * its *own internal* function-to-function calls are bound through the global
+ * symbol scope. They resolve to Node's same-named static OpenSSL exports
+ * instead of to libcrypto's own functions. The two OpenSSL builds have
+ * incompatible internal struct layouts (e.g., EVP_KEYMGMT), and the process
+ * segfaults inside EVP_KEYMGMT_is_a / X509_verify_cert on the first HTTPS
+ * request.
+ *
+ * Fix: explicitly dlopen libcrypto (and libssl) ourselves, before anything
+ * else can pull them in, with RTLD_DEEPBIND. That flag tells the loader to
+ * bind libcrypto's undefined references against libcrypto's own scope first,
+ * so its internal calls stay inside libcrypto. Subsequent dlopen calls by the
+ * .NET PAL (or anything else) for the same soname return our already-loaded
+ * handle, preserving the isolation.
+ *
+ * Notes:
+ *   - RTLD_DEEPBIND is a glibc extension. On macOS the dyld two-level
+ *     namespace already prevents this kind of cross-library symbol clobber,
+ *     so this is a no-op there. Windows uses LoadLibrary which is also
+ *     unaffected.
+ *   - Best-effort: if libcrypto isn't present at the expected sonames, we
+ *     skip silently and let the original load proceed (it may still work in
+ *     hosts that don't export conflicting OpenSSL symbols).
+ *   - RTLD_DEEPBIND on the *core* .so by itself is not sufficient — that flag
+ *     does not propagate to libraries loaded transitively after the core.
+ */
+static void preload_isolated_openssl(void) {
+#if defined(__linux__) && defined(__GLIBC__) && defined(RTLD_DEEPBIND)
+    static lib_handle_t s_libcrypto = NULL;
+    static lib_handle_t s_libssl = NULL;
+
+    if (s_libcrypto != NULL) {
+        return;
+    }
+
+    const int flags = RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
+    static const char* const crypto_sonames[] = { "libcrypto.so.3", "libcrypto.so.1.1", NULL };
+    static const char* const ssl_sonames[]    = { "libssl.so.3",    "libssl.so.1.1",    NULL };
+
+    /* libcrypto must be loaded before libssl (libssl depends on libcrypto). */
+    for (size_t i = 0; crypto_sonames[i] != NULL && !s_libcrypto; i++) {
+        s_libcrypto = dlopen(crypto_sonames[i], flags);
+    }
+    if (!s_libcrypto) {
+        return;
+    }
+    for (size_t i = 0; ssl_sonames[i] != NULL && !s_libssl; i++) {
+        s_libssl = dlopen(ssl_sonames[i], flags);
+    }
+#endif
+}
+
+/* ── Helper: open a library from a napi string path ──────────────────────
+ *
+ * On Windows the load uses LoadLibraryW with a UTF-16 path so that paths
+ * containing any character outside the process's active ANSI code page
+ * resolve correctly.
+ *
+ * Returns the loaded library handle on success. On any failure (bad
+ * argument, allocation failure, or loader rejection), throws a JS error
+ * and returns NULL. `error_prefix` scopes the loader error message
+ * (e.g. "Failed to load core library").
+ */
+static lib_handle_t open_lib_from_napi(napi_env env, napi_value path_val,
+                                       const char* error_prefix) {
+    size_t len8 = 0;
+    if (napi_get_value_string_utf8(env, path_val, NULL, 0, &len8) != napi_ok) {
+        napi_throw_type_error(env, NULL, "library path must be a string");
+        return NULL;
+    }
+    char* path_utf8 = (char*)malloc(len8 + 1);
+    if (!path_utf8) {
+        napi_throw_error(env, NULL, "Out of memory");
+        return NULL;
+    }
+    if (napi_get_value_string_utf8(env, path_val, path_utf8, len8 + 1, &len8) != napi_ok) {
+        free(path_utf8);
+        napi_throw_error(env, NULL, "Failed to read library path");
+        return NULL;
+    }
+
+    lib_handle_t handle = NULL;
+#ifdef _WIN32
+    size_t len16 = 0;
+    if (napi_get_value_string_utf16(env, path_val, NULL, 0, &len16) != napi_ok) {
+        free(path_utf8);
+        napi_throw_error(env, NULL, "Failed to read library path");
+        return NULL;
+    }
+    char16_t* path_utf16 = (char16_t*)malloc((len16 + 1) * sizeof(char16_t));
+    if (!path_utf16) {
+        free(path_utf8);
+        napi_throw_error(env, NULL, "Out of memory");
+        return NULL;
+    }
+    if (napi_get_value_string_utf16(env, path_val, path_utf16, len16 + 1, &len16) != napi_ok) {
+        free(path_utf16);
+        free(path_utf8);
+        napi_throw_error(env, NULL, "Failed to read library path");
+        return NULL;
+    }
+    /* char16_t and Windows wchar_t are both 16-bit; cast only at the OS boundary. */
+    handle = LoadLibraryW((LPCWSTR)path_utf16);
+    free(path_utf16);
+#else
+    handle = dlopen(path_utf8, RTLD_NOW | RTLD_LOCAL);
+#endif
+
+    if (!handle) {
+        char err_msg[1024];
+#ifdef _WIN32
+        DWORD win_err = GetLastError();
+        snprintf(err_msg, sizeof(err_msg), "%s: %s (LoadLibraryW error %lu)", error_prefix, path_utf8, (unsigned long)win_err);
+#else
+        const char* dl_err = dlerror();
+        snprintf(err_msg, sizeof(err_msg), "%s: %s (%s)", error_prefix, path_utf8, dl_err ? dl_err : "dlopen failed");
+#endif
+        napi_throw_error(env, NULL, err_msg);
+    }
+    free(path_utf8);
+    return handle;
+}
+
+/* ── Helper: clean up loaded libraries on error ───────────────────────── */
+
+static void cleanup_loaded_libs(void) {
+    if (g_core_lib) {
+        LIB_CLOSE(g_core_lib);
+        g_core_lib = NULL;
+    }
+    for (size_t i = 0; i < g_dep_lib_count; i++) {
+        if (g_dep_libs[i]) LIB_CLOSE(g_dep_libs[i]);
+    }
+    free(g_dep_libs);
+    g_dep_libs = NULL;
+    g_dep_lib_count = 0;
+    g_execute_command = NULL;
+    g_execute_command_with_callback = NULL;
+    g_execute_command_with_binary = NULL;
+}
+
+/* ── Helper: extract response and free native buffers ─────────────────── */
+
+static napi_value handle_response(napi_env env, const char* command,
+                                  ResponseBuffer* res) {
+    napi_value result;
+
+    if (res->Error && res->ErrorLength > 0) {
+        char* msg = (char*)malloc(res->ErrorLength + 64);
+        if (msg) {
+            snprintf(msg, res->ErrorLength + 64, "Command '%s' failed: %.*s",
+                     command, res->ErrorLength, (const char*)res->Error);
+            napi_throw_error(env, NULL, msg);
+            free(msg);
+        } else {
+            napi_throw_error(env, NULL, "Command failed (out of memory for error)");
+        }
+        free_native_buffer(res->Data);
+        free_native_buffer(res->Error);
+        return NULL;
+    }
+
+    napi_status st;
+    if (res->Data && res->DataLength > 0) {
+        st = napi_create_string_utf8(env, (const char*)res->Data,
+                                      res->DataLength, &result);
+    } else {
+        st = napi_create_string_utf8(env, "", 0, &result);
+    }
+
+    free_native_buffer(res->Data);
+    free_native_buffer(res->Error);
+
+    if (st != napi_ok) {
+        napi_throw_error(env, NULL, "Failed to create response string");
+        return NULL;
+    }
+
+    return result;
+}
+
+/* ── loadLibrary(corePath, depPaths?) ─────────────────────────────────── */
+
+static napi_value napi_load_library(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 1) {
+        napi_throw_error(env, NULL, "loadLibrary requires at least 1 argument (corePath)");
+        return NULL;
+    }
+
+    /* Close previously loaded libraries if any */
+    cleanup_loaded_libs();
+
+    /* Isolate libcrypto/libssl from Node's static OpenSSL symbols on Linux.
+     * No-op on other platforms. See preload_isolated_openssl() for details. */
+    preload_isolated_openssl();
+
+    /* Load dependency libraries first (e.g., onnxruntime on Windows) */
+    if (argc >= 2) {
+        napi_valuetype vt;
+        NAPI_CALL(env, napi_typeof(env, argv[1], &vt));
+
+        if (vt != napi_undefined && vt != napi_null) {
+            bool is_array = false;
+            NAPI_CALL(env, napi_is_array(env, argv[1], &is_array));
+            if (!is_array) {
+                napi_throw_type_error(env, NULL, "depPaths must be an array of strings");
+                return NULL;
+            }
+
+            uint32_t dep_count = 0;
+            NAPI_CALL(env, napi_get_array_length(env, argv[1], &dep_count));
+
+            if (dep_count > 0) {
+                g_dep_libs = (lib_handle_t*)calloc(dep_count, sizeof(lib_handle_t));
+                if (!g_dep_libs) {
+                    napi_throw_error(env, NULL, "Out of memory");
+                    return NULL;
+                }
+                g_dep_lib_count = dep_count;
+
+                for (uint32_t i = 0; i < dep_count; i++) {
+                    napi_value elem;
+                    NAPI_CALL(env, napi_get_element(env, argv[1], i, &elem));
+
+                    g_dep_libs[i] = open_lib_from_napi(
+                        env, elem, "Failed to load dependency library");
+                    if (!g_dep_libs[i]) {
+                        cleanup_loaded_libs();
+                        return NULL;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Load the core library */
+    g_core_lib = open_lib_from_napi(env, argv[0], "Failed to load core library");
+    if (!g_core_lib) {
+        cleanup_loaded_libs();
+        return NULL;
+    }
+
+    /* Resolve function pointers */
+    g_execute_command = (ExecuteCommandFn)LIB_SYM(g_core_lib, "execute_command");
+    if (!g_execute_command) {
+        cleanup_loaded_libs();
+        napi_throw_error(env, NULL, "Failed to resolve 'execute_command' symbol");
+        return NULL;
+    }
+
+    g_execute_command_with_callback = (ExecuteCommandWithCallbackFn)LIB_SYM(
+        g_core_lib, "execute_command_with_callback");
+    if (!g_execute_command_with_callback) {
+        cleanup_loaded_libs();
+        napi_throw_error(env, NULL, "Failed to resolve 'execute_command_with_callback' symbol");
+        return NULL;
+    }
+
+    g_execute_command_with_binary = (ExecuteCommandWithBinaryFn)LIB_SYM(
+        g_core_lib, "execute_command_with_binary");
+    if (!g_execute_command_with_binary) {
+        cleanup_loaded_libs();
+        napi_throw_error(env, NULL, "Failed to resolve 'execute_command_with_binary' symbol");
+        return NULL;
+    }
+
+    napi_value undefined;
+    NAPI_CALL(env, napi_get_undefined(env, &undefined));
+    return undefined;
+}
+
+/* ── executeCommand(command, dataJson) ────────────────────────────────── */
+
+static napi_value napi_execute_command(napi_env env, napi_callback_info info) {
+    if (!g_execute_command) {
+        napi_throw_error(env, NULL, "Native library not loaded. Call loadLibrary() first.");
+        return NULL;
+    }
+
+    size_t argc = 2;
+    napi_value argv[2];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 2) {
+        napi_throw_error(env, NULL, "executeCommand requires 2 arguments (command, dataJson)");
+        return NULL;
+    }
+
+    /* Extract command string */
+    size_t cmd_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], NULL, 0, &cmd_len));
+    if (!check_string_length(env, cmd_len, "command")) return NULL;
+    char* cmd = (char*)malloc(cmd_len + 1);
+    if (!cmd) { napi_throw_error(env, NULL, "Out of memory"); return NULL; }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], cmd, cmd_len + 1, &cmd_len));
+
+    /* Extract data JSON string */
+    size_t data_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], NULL, 0, &data_len));
+    if (!check_string_length(env, data_len, "dataJson")) { free(cmd); return NULL; }
+    char* data = (char*)malloc(data_len + 1);
+    if (!data) { free(cmd); napi_throw_error(env, NULL, "Out of memory"); return NULL; }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], data, data_len + 1, &data_len));
+
+    RequestBuffer req = {
+        .Command = cmd,
+        .CommandLength = (int32_t)cmd_len,
+        .Data = data,
+        .DataLength = (int32_t)data_len
+    };
+    ResponseBuffer res = { NULL, 0, NULL, 0 };
+
+    g_execute_command(&req, &res);
+
+    napi_value result = handle_response(env, cmd, &res);
+
+    free(cmd);
+    free(data);
+    return result;
+}
+
+/* ── executeCommandWithBinary(command, dataJson, binaryBuffer) ────────── */
+
+static napi_value napi_execute_command_with_binary(napi_env env,
+                                                    napi_callback_info info) {
+    if (!g_execute_command_with_binary) {
+        napi_throw_error(env, NULL, "Native library not loaded. Call loadLibrary() first.");
+        return NULL;
+    }
+
+    size_t argc = 3;
+    napi_value argv[3];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 3) {
+        napi_throw_error(env, NULL,
+            "executeCommandWithBinary requires 3 arguments (command, dataJson, binaryBuffer)");
+        return NULL;
+    }
+
+    /* Extract command string */
+    size_t cmd_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], NULL, 0, &cmd_len));
+    if (!check_string_length(env, cmd_len, "command")) return NULL;
+    char* cmd = (char*)malloc(cmd_len + 1);
+    if (!cmd) { napi_throw_error(env, NULL, "Out of memory"); return NULL; }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], cmd, cmd_len + 1, &cmd_len));
+
+    /* Extract data JSON string */
+    size_t data_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], NULL, 0, &data_len));
+    if (!check_string_length(env, data_len, "dataJson")) { free(cmd); return NULL; }
+    char* data = (char*)malloc(data_len + 1);
+    if (!data) { free(cmd); napi_throw_error(env, NULL, "Out of memory"); return NULL; }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], data, data_len + 1, &data_len));
+
+    /* Extract binary buffer */
+    void* bin_data = NULL;
+    size_t bin_len = 0;
+    bool is_buffer = false;
+    NAPI_CALL(env, napi_is_buffer(env, argv[2], &is_buffer));
+
+    if (is_buffer) {
+        NAPI_CALL(env, napi_get_buffer_info(env, argv[2], &bin_data, &bin_len));
+    } else {
+        bool is_typedarray = false;
+        NAPI_CALL(env, napi_is_typedarray(env, argv[2], &is_typedarray));
+        if (is_typedarray) {
+            napi_typedarray_type type;
+            size_t length;
+            void* arr_data;
+            napi_value arr_buf;
+            size_t offset;
+            NAPI_CALL(env, napi_get_typedarray_info(env, argv[2], &type, &length,
+                                                     &arr_data, &arr_buf, &offset));
+            if (type != napi_uint8_array) {
+                free(cmd);
+                free(data);
+                napi_throw_type_error(env, NULL,
+                    "binaryBuffer must be a Buffer or Uint8Array");
+                return NULL;
+            }
+            bin_data = arr_data;
+            bin_len = length;
+        } else {
+            free(cmd);
+            free(data);
+            napi_throw_type_error(env, NULL,
+                "binaryBuffer must be a Buffer or Uint8Array");
+            return NULL;
+        }
+    }
+
+    if (!check_string_length(env, bin_len, "binaryBuffer")) {
+        free(cmd); free(data); return NULL;
+    }
+
+    StreamingRequestBuffer req = {
+        .Command = cmd,
+        .CommandLength = (int32_t)cmd_len,
+        .Data = data,
+        .DataLength = (int32_t)data_len,
+        .BinaryData = bin_data,
+        .BinaryDataLength = (int32_t)bin_len
+    };
+    ResponseBuffer res = { NULL, 0, NULL, 0 };
+
+    g_execute_command_with_binary(&req, &res);
+
+    napi_value result = handle_response(env, cmd, &res);
+
+    free(cmd);
+    free(data);
+    return result;
+}
+
+/* ── Async (non-streaming) work data ──────────────────────────────────── */
+
+typedef struct {
+    char* command;
+    size_t command_length;
+    char* data;
+    size_t data_length;
+    ResponseBuffer response;
+    napi_deferred deferred;
+    napi_async_work work;
+} AsyncWorkData;
+
+/* Runs on the libuv worker thread */
+static void async_execute(napi_env env, void* data) {
+    AsyncWorkData* work_data = (AsyncWorkData*)data;
+
+    RequestBuffer req = {
+        .Command = work_data->command,
+        .CommandLength = (int32_t)work_data->command_length,
+        .Data = work_data->data,
+        .DataLength = (int32_t)work_data->data_length
+    };
+
+    work_data->response.Data = NULL;
+    work_data->response.DataLength = 0;
+    work_data->response.Error = NULL;
+    work_data->response.ErrorLength = 0;
+
+    g_execute_command(&req, &work_data->response);
+}
+
+/* Runs on the JS main thread after async_execute completes */
+static void async_complete(napi_env env, napi_status status, void* data) {
+    AsyncWorkData* work_data = (AsyncWorkData*)data;
+
+    if (status == napi_cancelled) {
+        reject_with_error(env, work_data->deferred, "Async work cancelled");
+    } else if (status != napi_ok) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "Async work failed with N-API status %d", (int)status);
+        reject_with_error(env, work_data->deferred, msg);
+    } else if (work_data->response.Error && work_data->response.ErrorLength > 0) {
+        int32_t elen = work_data->response.ErrorLength;
+        size_t msg_size = (size_t)elen + 128;
+        char* msg = (char*)malloc(msg_size);
+        if (msg) {
+            snprintf(msg, msg_size, "Command '%s' failed: %.*s",
+                     work_data->command, elen,
+                     (const char*)work_data->response.Error);
+            reject_with_error(env, work_data->deferred, msg);
+            free(msg);
+        } else {
+            reject_with_error(env, work_data->deferred, "Command failed (OOM)");
+        }
+    } else {
+        napi_value result;
+        napi_status st;
+        if (work_data->response.Data && work_data->response.DataLength > 0) {
+            st = napi_create_string_utf8(env,
+                (const char*)work_data->response.Data,
+                work_data->response.DataLength, &result);
+        } else {
+            st = napi_create_string_utf8(env, "", 0, &result);
+        }
+        if (st != napi_ok) {
+            reject_with_error(env, work_data->deferred,
+                "Failed to create response string");
+        } else {
+            napi_resolve_deferred(env, work_data->deferred, result);
+        }
+    }
+
+    free_native_buffer(work_data->response.Data);
+    free_native_buffer(work_data->response.Error);
+    napi_delete_async_work(env, work_data->work);
+    free(work_data->command);
+    free(work_data->data);
+    free(work_data);
+}
+
+/* executeCommandAsync(command, dataJson) → Promise<string> */
+static napi_value napi_execute_command_async(napi_env env,
+                                              napi_callback_info info) {
+    if (!g_execute_command) {
+        napi_throw_error(env, NULL, "Native library not loaded. Call loadLibrary() first.");
+        return NULL;
+    }
+
+    size_t argc = 2;
+    napi_value argv[2];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 2) {
+        napi_throw_error(env, NULL,
+            "executeCommandAsync requires 2 arguments (command, dataJson)");
+        return NULL;
+    }
+
+    /* Extract command string */
+    size_t cmd_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], NULL, 0, &cmd_len));
+    if (!check_string_length(env, cmd_len, "command")) return NULL;
+    char* cmd = (char*)malloc(cmd_len + 1);
+    if (!cmd) { napi_throw_error(env, NULL, "Out of memory"); return NULL; }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], cmd, cmd_len + 1, &cmd_len));
+
+    /* Extract data JSON string */
+    size_t data_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], NULL, 0, &data_len));
+    if (!check_string_length(env, data_len, "dataJson")) { free(cmd); return NULL; }
+    char* data_str = (char*)malloc(data_len + 1);
+    if (!data_str) {
+        free(cmd);
+        napi_throw_error(env, NULL, "Out of memory");
+        return NULL;
+    }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], data_str, data_len + 1, &data_len));
+
+    /* Allocate work data */
+    AsyncWorkData* work_data = (AsyncWorkData*)calloc(1, sizeof(AsyncWorkData));
+    if (!work_data) {
+        free(cmd);
+        free(data_str);
+        napi_throw_error(env, NULL, "Out of memory");
+        return NULL;
+    }
+    work_data->command = cmd;
+    work_data->command_length = cmd_len;
+    work_data->data = data_str;
+    work_data->data_length = data_len;
+
+    /* Create promise */
+    napi_value promise;
+    napi_status st = napi_create_promise(env, &work_data->deferred, &promise);
+    if (st != napi_ok) {
+        free(cmd); free(data_str); free(work_data);
+        napi_throw_error(env, NULL, "Failed to create promise");
+        return NULL;
+    }
+
+    /* Create and queue async work */
+    napi_value work_name;
+    st = napi_create_string_utf8(env, "foundry_async_cmd", NAPI_AUTO_LENGTH, &work_name);
+    if (st != napi_ok) {
+        free(cmd); free(data_str); free(work_data);
+        napi_throw_error(env, NULL, "Failed to create async work name");
+        return NULL;
+    }
+
+    st = napi_create_async_work(env, NULL, work_name,
+                                 async_execute, async_complete,
+                                 work_data, &work_data->work);
+    if (st != napi_ok) {
+        free(cmd); free(data_str); free(work_data);
+        napi_throw_error(env, NULL, "Failed to create async work");
+        return NULL;
+    }
+
+    st = napi_queue_async_work(env, work_data->work);
+    if (st != napi_ok) {
+        napi_delete_async_work(env, work_data->work);
+        free(cmd); free(data_str); free(work_data);
+        napi_throw_error(env, NULL, "Failed to queue async work");
+        return NULL;
+    }
+
+    return promise;
+}
+
+/* ── Streaming async work data ────────────────────────────────────────── */
+
+/* Chunk data passed from the native callback to the JS thread.
+   Carries both the data pointer and its length so we avoid strlen(). */
+typedef struct StreamingWorkData StreamingWorkData;
+typedef struct {
+    char*  data;
+    size_t length;
+    StreamingWorkData* work_data; /* back-pointer for cancellation */
+} ChunkData;
+
+struct StreamingWorkData {
+    /* Input (owned, freed after work completes) */
+    char* command;
+    size_t command_length;
+    char* data;
+    size_t data_length;
+
+    /* Threadsafe function for streaming callback */
+    napi_threadsafe_function tsfn;
+
+    /* Set by the JS thread when the callback throws an exception.
+       Checked by the native trampoline to cancel the stream. */
+    volatile int should_cancel;
+
+    /* Output from native call */
+    ResponseBuffer response;
+
+    /* Promise */
+    napi_deferred deferred;
+    napi_async_work work;
+};
+
+/* Called on the JS thread when the native callback fires */
+static void streaming_call_js(napi_env env, napi_value js_callback,
+                               void* context, void* data) {
+    if (!env || !data) return;
+
+    ChunkData* chunk = (ChunkData*)data;
+
+    napi_value argv[1];
+    napi_value global;
+    napi_status status;
+
+    status = napi_create_string_utf8(env, chunk->data, chunk->length, &argv[0]);
+    StreamingWorkData* work_data = chunk->work_data;
+    free(chunk->data);
+    free(chunk);
+
+    if (status != napi_ok) return;
+
+    status = napi_get_global(env, &global);
+    if (status != napi_ok) return;
+
+    napi_value result;
+    status = napi_call_function(env, global, js_callback, 1, argv, &result);
+
+    /* If the JS callback threw, clear the exception and signal cancellation
+       to the native trampoline so the stream stops promptly. */
+    if (status == napi_pending_exception) {
+        napi_value exception;
+        napi_get_and_clear_last_exception(env, &exception);
+        if (work_data) {
+            work_data->should_cancel = 1;
+        }
+    }
+}
+
+/* Native callback trampoline invoked by the core library (possibly from
+   a worker thread). Copies chunk data and dispatches to the JS thread
+   via threadsafe function. Returns 0 to continue, 1 to cancel. */
+static int32_t streaming_native_callback(const void* data, int32_t length,
+                                          void* userData) {
+    StreamingWorkData* work_data = (StreamingWorkData*)userData;
+    if (!work_data || !work_data->tsfn || !data || length <= 0) {
+        return 0; /* continue even on unexpected state */
+    }
+
+    /* Check if the JS callback requested cancellation */
+    if (work_data->should_cancel) {
+        return 1; /* cancel */
+    }
+
+    /* Heap-copy the chunk so it survives until the JS thread picks it up */
+    ChunkData* chunk = (ChunkData*)malloc(sizeof(ChunkData));
+    if (!chunk) return 1; /* cancel on OOM */
+    chunk->data = (char*)malloc((size_t)length);
+    if (!chunk->data) { free(chunk); return 1; }
+    memcpy(chunk->data, data, (size_t)length);
+    chunk->length = (size_t)length;
+    chunk->work_data = work_data;
+
+    napi_status status = napi_call_threadsafe_function(
+        work_data->tsfn, chunk, napi_tsfn_blocking);
+    if (status != napi_ok) {
+        free(chunk->data);
+        free(chunk);
+        return 1; /* cancel */
+    }
+
+    return 0; /* continue */
+}
+
+/* Runs on the libuv worker thread – must NOT call napi_* (except tsfn) */
+static void streaming_execute(napi_env env, void* data) {
+    StreamingWorkData* work_data = (StreamingWorkData*)data;
+
+    RequestBuffer req = {
+        .Command = work_data->command,
+        .CommandLength = (int32_t)work_data->command_length,
+        .Data = work_data->data,
+        .DataLength = (int32_t)work_data->data_length
+    };
+
+    work_data->response.Data = NULL;
+    work_data->response.DataLength = 0;
+    work_data->response.Error = NULL;
+    work_data->response.ErrorLength = 0;
+
+    g_execute_command_with_callback(
+        &req, &work_data->response,
+        streaming_native_callback, work_data);
+}
+
+/* Runs on the JS main thread after streaming_execute completes */
+static void streaming_complete(napi_env env, napi_status status, void* data) {
+    StreamingWorkData* work_data = (StreamingWorkData*)data;
+
+    /* Release the threadsafe function */
+    napi_release_threadsafe_function(work_data->tsfn, napi_tsfn_release);
+
+    if (status == napi_cancelled) {
+        reject_with_error(env, work_data->deferred, "Async work cancelled");
+    } else if (work_data->response.Error && work_data->response.ErrorLength > 0) {
+        /* Build error message */
+        int32_t elen = work_data->response.ErrorLength;
+        size_t msg_size = (size_t)elen + 128;
+        char* msg = (char*)malloc(msg_size);
+        if (msg) {
+            snprintf(msg, msg_size, "Command '%s' failed: %.*s",
+                     work_data->command, elen,
+                     (const char*)work_data->response.Error);
+            reject_with_error(env, work_data->deferred, msg);
+            free(msg);
+        } else {
+            reject_with_error(env, work_data->deferred, "Command failed (OOM)");
+        }
+    } else {
+        napi_value result;
+        if (work_data->response.Data && work_data->response.DataLength > 0) {
+            napi_create_string_utf8(env,
+                (const char*)work_data->response.Data,
+                work_data->response.DataLength, &result);
+        } else {
+            napi_create_string_utf8(env, "", 0, &result);
+        }
+        napi_resolve_deferred(env, work_data->deferred, result);
+    }
+
+    /* Free native response buffers */
+    free_native_buffer(work_data->response.Data);
+    free_native_buffer(work_data->response.Error);
+
+    /* Free work data */
+    napi_delete_async_work(env, work_data->work);
+    free(work_data->command);
+    free(work_data->data);
+    free(work_data);
+}
+
+/* ── Streaming setup helpers ──────────────────────────────────────────── */
+
+/* Free a partially-initialized StreamingWorkData. If the tsfn was created,
+   release it before freeing. */
+static void streaming_cleanup(StreamingWorkData* work_data, bool has_tsfn) {
+    if (has_tsfn) {
+        napi_release_threadsafe_function(work_data->tsfn, napi_tsfn_release);
+    }
+    free(work_data->command);
+    free(work_data->data);
+    free(work_data);
+}
+
+/* Create the promise, threadsafe function, async work, and queue it.
+   On success, sets *out_promise and returns true (work_data ownership
+   transfers to streaming_complete). On failure, cleans up work_data,
+   throws a JS error, and returns false. */
+static bool streaming_setup(napi_env env, napi_value js_callback,
+                             StreamingWorkData* work_data,
+                             napi_value* out_promise) {
+    napi_status st;
+
+    st = napi_create_promise(env, &work_data->deferred, out_promise);
+    if (st != napi_ok) {
+        streaming_cleanup(work_data, false);
+        napi_throw_error(env, NULL, "Failed to create streaming promise");
+        return false;
+    }
+
+    napi_value resource_name;
+    st = napi_create_string_utf8(env, "foundry_streaming_cb",
+                                  NAPI_AUTO_LENGTH, &resource_name);
+    if (st != napi_ok) {
+        streaming_cleanup(work_data, false);
+        napi_throw_error(env, NULL, "Failed to create streaming operation");
+        return false;
+    }
+
+    st = napi_create_threadsafe_function(
+        env, js_callback, NULL, resource_name,
+        0,    /* max_queue_size: 0 = unlimited */
+        1,    /* initial_thread_count */
+        NULL, /* thread_finalize_data */
+        NULL, /* thread_finalize_cb */
+        NULL, /* context */
+        streaming_call_js,
+        &work_data->tsfn);
+    if (st != napi_ok) {
+        streaming_cleanup(work_data, false);
+        napi_throw_error(env, NULL, "Failed to create streaming callback");
+        return false;
+    }
+
+    napi_value work_name;
+    st = napi_create_string_utf8(env, "foundry_streaming_work",
+                                  NAPI_AUTO_LENGTH, &work_name);
+    if (st != napi_ok) {
+        streaming_cleanup(work_data, true);
+        napi_throw_error(env, NULL, "Failed to create streaming operation");
+        return false;
+    }
+
+    st = napi_create_async_work(env, NULL, work_name,
+                                 streaming_execute,
+                                 streaming_complete,
+                                 work_data,
+                                 &work_data->work);
+    if (st != napi_ok) {
+        streaming_cleanup(work_data, true);
+        napi_throw_error(env, NULL, "Failed to create streaming async work");
+        return false;
+    }
+
+    st = napi_queue_async_work(env, work_data->work);
+    if (st != napi_ok) {
+        napi_delete_async_work(env, work_data->work);
+        streaming_cleanup(work_data, true);
+        napi_throw_error(env, NULL, "Failed to queue streaming work");
+        return false;
+    }
+
+    return true;
+}
+
+/* ── executeCommandStreaming(command, dataJson, callback) → Promise ───── */
+
+static napi_value napi_execute_command_streaming(napi_env env,
+                                                  napi_callback_info info) {
+    if (!g_execute_command_with_callback) {
+        napi_throw_error(env, NULL, "Native library not loaded. Call loadLibrary() first.");
+        return NULL;
+    }
+
+    size_t argc = 3;
+    napi_value argv[3];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 3) {
+        napi_throw_error(env, NULL,
+            "executeCommandStreaming requires 3 arguments (command, dataJson, callback)");
+        return NULL;
+    }
+
+    /* Verify callback is a function */
+    napi_valuetype cb_type;
+    NAPI_CALL(env, napi_typeof(env, argv[2], &cb_type));
+    if (cb_type != napi_function) {
+        napi_throw_type_error(env, NULL, "Third argument must be a function");
+        return NULL;
+    }
+
+    /* Extract command string */
+    size_t cmd_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], NULL, 0, &cmd_len));
+    if (!check_string_length(env, cmd_len, "command")) return NULL;
+    char* cmd = (char*)malloc(cmd_len + 1);
+    if (!cmd) { napi_throw_error(env, NULL, "Out of memory"); return NULL; }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], cmd, cmd_len + 1, &cmd_len));
+
+    /* Extract data JSON string */
+    size_t data_len = 0;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], NULL, 0, &data_len));
+    if (!check_string_length(env, data_len, "dataJson")) { free(cmd); return NULL; }
+    char* data_str = (char*)malloc(data_len + 1);
+    if (!data_str) {
+        free(cmd);
+        napi_throw_error(env, NULL, "Out of memory");
+        return NULL;
+    }
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], data_str, data_len + 1, &data_len));
+
+    /* Allocate work data */
+    StreamingWorkData* work_data = (StreamingWorkData*)calloc(1, sizeof(StreamingWorkData));
+    if (!work_data) {
+        free(cmd);
+        free(data_str);
+        napi_throw_error(env, NULL, "Out of memory");
+        return NULL;
+    }
+    work_data->command = cmd;
+    work_data->command_length = cmd_len;
+    work_data->data = data_str;
+    work_data->data_length = data_len;
+
+    /* Setup phase: use manual status checks instead of NAPI_CALL so we can
+       clean up work_data on failure. Once async work is queued successfully,
+       streaming_complete owns all cleanup. */
+    napi_value promise = NULL;
+    if (!streaming_setup(env, argv[2], work_data, &promise)) {
+        return NULL;
+    }
+
+    return promise;
+}
+
+/* ── Module initialization ────────────────────────────────────────────── */
+
+static napi_value init(napi_env env, napi_value exports) {
+    napi_property_descriptor props[] = {
+        { "loadLibrary", NULL, napi_load_library, NULL, NULL, NULL,
+          napi_default, NULL },
+        { "executeCommand", NULL, napi_execute_command, NULL, NULL, NULL,
+          napi_default, NULL },
+        { "executeCommandAsync", NULL, napi_execute_command_async, NULL,
+          NULL, NULL, napi_default, NULL },
+        { "executeCommandWithBinary", NULL, napi_execute_command_with_binary,
+          NULL, NULL, NULL, napi_default, NULL },
+        { "executeCommandStreaming", NULL, napi_execute_command_streaming,
+          NULL, NULL, NULL, napi_default, NULL },
+    };
+
+    NAPI_CALL(env, napi_define_properties(env, exports,
+        sizeof(props) / sizeof(props[0]), props));
+
+    return exports;
+}
+
+NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
