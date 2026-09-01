@@ -94,8 +94,8 @@ class OliveHfQuantizationConfig(QuantizationConfigMixin):
 
     def post_init(self):
         """Safety checker that arguments are correct."""
-        if self.bits not in [4, 8]:
-            raise ValueError(f"Only 4-bit and 8-bit quantization supported, got {self.bits}")
+        if self.bits not in [2, 4, 8]:
+            raise ValueError(f"Only 2-bit, 4-bit and 8-bit quantization supported, got {self.bits}")
 
     def to_dict(self) -> dict:
         """Serialize this instance to a Python dictionary."""
@@ -146,6 +146,7 @@ class OliveHfQuantizer(HfQuantizer):
 
     # only support load and inference, no on-the-fly quantization
     requires_calibration = True
+    modules_to_not_convert: list[str] | None = None
 
     def _process_model_before_weight_loading(
         self, model: PreTrainedModel, keep_in_fp32_modules: list[str] | None = None, **kwargs
