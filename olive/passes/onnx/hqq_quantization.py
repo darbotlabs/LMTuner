@@ -72,6 +72,7 @@ class OnnxHqqQuantization(Pass):
             return model
         output_model_path = resolve_onnx_path(output_model_path, Path(model.model_path).name)
         ir_model = model.load_ir_model()
+        ir.external_data.load_to_model(ir_model)
         ir_model.graph.opset_imports[MSFT_DOMAIN] = 1
         self._quantize_model(
             ir_model,
@@ -180,7 +181,10 @@ class OnnxHqqQuantization(Pass):
         if accuracy_level > 0:
             kwargs["accuracy_level"] = accuracy_level
 
-        node.outputs[0].name = node.outputs[0].name + "_Q4"
+        # Only rename intermediate outputs; preserve graph output names so
+        # downstream consumers (e.g. genai_config.json) keep working.
+        if node.outputs[0] not in node.graph.outputs:
+            node.outputs[0].name = node.outputs[0].name + "_Q4"
 
         return ir.node(
             domain=MSFT_DOMAIN,

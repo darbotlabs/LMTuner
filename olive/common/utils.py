@@ -294,14 +294,29 @@ def format_data(data, io_config):
         data = dict(zip(input_names, [data]))
     elif not isinstance(data, dict):
         raise ValueError(f"Invalid input data format: {data}")
-    return {
-        k: np.ascontiguousarray(
-            data[k].cpu().numpy() if isinstance(data[k], torch.Tensor) else data[k],
-            dtype=name_to_type[k],
-        )
-        for k in data
-        if k in input_names
-    }
+
+    formatted = {}
+    for k in data:
+        if k not in input_names:
+            continue
+        v = data[k]
+        if isinstance(v, torch.Tensor):
+            v = v.cpu()
+            if v.dtype == torch.bfloat16:
+                import ml_dtypes
+
+                v = v.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+            else:
+                v = v.numpy()
+
+        target_dtype = name_to_type[k]
+        # ONNX BFLOAT16 is commonly surfaced as "uint16" in io_config; preserve ml_dtypes.bfloat16
+        # so callers can detect bf16 and route through the IOBinding path.
+        if str(getattr(v, "dtype", "")) == "bfloat16" and str(target_dtype) == "uint16":
+            formatted[k] = np.ascontiguousarray(v)
+        else:
+            formatted[k] = np.ascontiguousarray(v, dtype=target_dtype)
+    return formatted
 
 
 def resolve_torch_dtype(dtype):
@@ -327,6 +342,8 @@ def get_attr(module, attr, fail_on_not_found=False):
 
     :param module: module to get attribute from.
     :param attr: attribute name, can be a string with dot notation. If empty, return module.
+        Each component is first tried as a regular attribute name. If that fails, it is tried as
+        an integer index and then as a string key, to support list and dict access respectively.
     :param fail_on_not_found: if True, raise AttributeError if attribute is not found.
     :return: attribute
     """
@@ -334,12 +351,25 @@ def get_attr(module, attr, fail_on_not_found=False):
         # return module if attr is empty
         return module
 
-    attr = attr.split(".")
-    for a in attr:
+    parts = attr.split(".")
+    for a in parts:
         try:
             module = getattr(module, a)
-        except AttributeError as e:
-            not_found_message = f"Attribute {attr} not found."
+            continue
+        except AttributeError:
+            # Expected for non-attribute containers; fall back to index/key access below.
+            _ = None
+        # Fall back to index/key access for lists, tuples, dicts, etc.
+        try:
+            module = module[int(a)]
+            continue
+        except (ValueError, KeyError, IndexError, TypeError):
+            logger.debug("Failed integer index access for '%s'; trying string-key access.", a)
+        try:
+            module = module[a]
+            continue
+        except (KeyError, IndexError, TypeError) as e:
+            not_found_message = f"Attribute {'.'.join(parts)} not found."
             if fail_on_not_found:
                 raise AttributeError(not_found_message) from e
             else:
@@ -466,8 +496,12 @@ def hardlink_copy_file(src, dst, *, follow_symlinks=True):
         dst.unlink()
 
     try:
-        os.link(src, dst, follow_symlinks=follow_symlinks)
-    except OSError as e:
+        try:
+            os.link(src, dst, follow_symlinks=follow_symlinks)
+        except NotImplementedError:
+            # Python 3.14 on Windows does not support the follow_symlinks argument.
+            os.link(src, dst)
+    except (NotImplementedError, OSError) as e:
         # for instance, hardlinking across filesystems is not supported
         logger.debug("Linking failed with %s. Copying.", e)
         shutil.copy2(src, dst, follow_symlinks=follow_symlinks)

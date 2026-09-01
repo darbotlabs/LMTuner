@@ -28,7 +28,7 @@ class TestLocalSystem:
     def test_run_pass(self):
         # setup
         p = MagicMock()
-        p.run.return_value = PyTorchModelHandler("model_path")
+        p.run.return_value = PyTorchModelHandler(model_path="model_path", model_loader=lambda _: None)
         olive_model = MagicMock()
         output_model_path = "output_model_path"
 
@@ -75,7 +75,7 @@ class TestLocalSystem:
         metric = metric_func()
         evaluator_config = OliveEvaluatorConfig(metrics=[metric])
         # olive_model.framework = Framework.ONNX
-        expected_res = MetricResult.parse_obj(
+        expected_res = MetricResult.model_validate(
             {
                 sub_metric.name: {
                     "value": 0.382715310,

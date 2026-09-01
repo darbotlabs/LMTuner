@@ -14,6 +14,17 @@
 
 LMTuner (Language Model Tuner) is a fork of Microsoft Olive with significant framework improvements and enhancements. Given a model and targeted hardware, LMTuner composes the best suitable optimization techniques to output the most efficient ONNX model(s) for inferencing on the cloud or edge, while taking a set of constraints such as accuracy and latency into consideration.
 
+## Harness (Olive + OptiGuide + Foundry Local)
+
+LMTuner is the Olive fork (package `lmcli`). This repo also vendors:
+
+- [OptiGuide](harness/optiguide/) — GenAI for optimization and decision intelligence
+- [Foundry Local](harness/foundry-local/) — on-device run/serve for optimized models
+
+Olive is not nested as a second copy; the merge **is** how Olive lives here. Layout: [harness/README.md](harness/README.md).
+
+**Full walkthrough (install, first optimize, diffusion-lora, Foundry, OptiGuide, `lmcli` command map):** [docs/LMTUNER_SPEC.md](docs/LMTUNER_SPEC.md)
+
 ## Getting Started
 
 ###  Quickstart
@@ -77,6 +88,8 @@ The sample chat app to run is found as [model-chat.py](https://github.com/micros
 - [LMTuner GitHub](https://github.com/darbotlabs/LMTuner)
 - [Original Olive Documentation](https://microsoft.github.io/Olive)
 - [GitHub Copilot Integration](https://github.com/darbotlabs/LMTuner#copilot-integration)
+- [LMTuner spec (install, workflow, command map)](docs/LMTUNER_SPEC.md)
+- [Harness: OptiGuide + Foundry Local](harness/README.md)
 
 ## GitHub Copilot Integration
 

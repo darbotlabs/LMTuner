@@ -38,4 +38,19 @@ class HuggingfaceContainer(DataContainer):
             DataComponentType.PRE_PROCESS_DATA.value: "audio_classification_pre_process",
             DataComponentType.POST_PROCESS_DATA.value: "text_classification_post_process",
         },
+        "speech-transcription": {
+            DataComponentType.PRE_PROCESS_DATA.value: "speech_transcription_pre_process",
+        },
+        "vision-vqa": {
+            DataComponentType.PRE_PROCESS_DATA.value: "vision_vqa_pre_process",
+            DataComponentType.DATALOADER.value: "vision_vqa_dataloader",
+        },
+        "vision-chart-qa": {
+            DataComponentType.PRE_PROCESS_DATA.value: "vision_vqa_pre_process",
+            DataComponentType.DATALOADER.value: "vision_vqa_dataloader",
+        },
+        "vision-ocr": {
+            DataComponentType.PRE_PROCESS_DATA.value: "vision_vqa_pre_process",
+            DataComponentType.DATALOADER.value: "vision_vqa_dataloader",
+        },
     }

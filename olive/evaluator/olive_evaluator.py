@@ -3,6 +3,7 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 import collections
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -10,15 +11,15 @@ from copy import deepcopy
 from functools import partial
 from numbers import Number
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Optional, Union
 
 import numpy as np
 import torch
+from pydantic import Field, field_validator, model_validator
 
 from olive.common.config_utils import NestedConfig, validate_config
 from olive.common.import_lib import import_user_module
 from olive.common.ort_inference import OrtInferenceSession, prepare_io_bindings
-from olive.common.pydantic_v1 import Field, root_validator, validator
 from olive.common.user_module_loader import UserModuleLoader
 from olive.common.utils import format_data, load_weights, tensor_data_to_device
 from olive.constants import Framework
@@ -26,6 +27,7 @@ from olive.data.config import DataConfig
 from olive.data.container.dummy_data_container import TRANSFORMER_DUMMY_DATA_CONTAINER
 from olive.data.template import dummy_data_config_template
 from olive.evaluator.metric import (
+    AccuracySubType,
     LatencySubType,
     Metric,
     MetricType,
@@ -56,6 +58,101 @@ logger = logging.getLogger(__name__)
 class OliveModelOutput(NamedTuple):
     preds: Any
     logits: Any
+    extras: Any = None
+
+
+# Text-based accuracy sub-types that work with string predictions/targets
+_TEXT_BASED_ACCURACY_SUBTYPES = {AccuracySubType.WER, AccuracySubType.RTFX}
+_VISION_ACCURACY_SUBTYPES = {
+    AccuracySubType.EXACT_MATCH,
+    AccuracySubType.RELAXED_ACCURACY,
+    AccuracySubType.WORD_SORT_RATIO,
+}
+
+# Task-to-metric validation: maps data task types to their allowed vision metrics.
+# Metrics are aligned with standard public vision benchmarks:
+#   - vision-vqa (exact_match): AI2D, ScienceQA, TextVQA, MathVista, MMMU, InterGPS
+#   - vision-chart-qa (relaxed_accuracy): ChartQA (±5% numeric tolerance)
+#   - vision-ocr (word_sort_ratio): OCR (word-level overlap)
+_VISION_TASK_METRIC_MAP = {
+    "vision-vqa": {AccuracySubType.EXACT_MATCH},
+    "vision-chart-qa": {AccuracySubType.RELAXED_ACCURACY},
+    "vision-ocr": {AccuracySubType.WORD_SORT_RATIO},
+}
+
+
+def _is_text_based_metric(metric: "Metric") -> bool:
+    """Check if metric uses text-based accuracy sub-types (WER, RTFx).
+
+    Raises ValueError if text-based and tensor-based sub-types are mixed,
+    as they require different inference paths.
+    """
+    if metric.type != MetricType.ACCURACY:
+        return False
+    text_based = [sub.name in _TEXT_BASED_ACCURACY_SUBTYPES for sub in metric.sub_types]
+    if any(text_based) and not all(text_based):
+        raise ValueError(
+            "Cannot mix text-based accuracy sub-types (WER, RTFx) with tensor-based sub-types "
+            "(accuracy_score, f1_score, etc.) in the same metric. Please define them as separate metrics."
+        )
+    return all(text_based)
+
+
+def _is_vision_metric(metric: "Metric") -> bool:
+    """Check if metric uses vision accuracy sub-types (exact_match, relaxed_accuracy, word_sort_ratio).
+
+    Raises ValueError if vision sub-types are mixed with non-vision sub-types,
+    as they require different inference paths.
+    """
+    if metric.type != MetricType.ACCURACY:
+        return False
+    vision_based = [sub.name in _VISION_ACCURACY_SUBTYPES for sub in metric.sub_types]
+    if any(vision_based) and not all(vision_based):
+        raise ValueError(
+            "Cannot mix vision accuracy sub-types (exact_match, relaxed_accuracy, word_sort_ratio) "
+            "with other sub-types in the same metric. Please define them as separate metrics."
+        )
+    return all(vision_based)
+
+
+def _validate_vision_task_metric(metric: "Metric") -> None:
+    """Validate that the vision metric sub-types are compatible with the data task type.
+
+    Raises ValueError if the metric is not compatible with the task.
+    """
+    if not _is_vision_metric(metric):
+        return
+
+    task_type = None
+    if metric.data_config:
+        # Extract task from pre_process_data_config params, which is how HuggingfaceContainer
+        # maps task types (e.g., "vision-vqa", "vision-chart-qa", "vision-ocr") to components.
+        pre_process_config = metric.data_config.pre_process_data_config
+        if pre_process_config:
+            if pre_process_config.params:
+                task_type = pre_process_config.params.get("task")
+            # Also try to infer task from the component type name if params don't specify it
+            if task_type is None and pre_process_config.type == "vision_vqa_pre_process":
+                # Default component is used but task param is missing; skip validation
+                # since we can't determine which specific vision task is intended
+                return
+
+    if task_type is None:
+        # No task type specified, allow any vision metric
+        return
+
+    allowed_metrics = _VISION_TASK_METRIC_MAP.get(task_type)
+    if allowed_metrics is None:
+        raise ValueError(
+            f"Unknown vision task type '{task_type}'. Supported task types: {list(_VISION_TASK_METRIC_MAP.keys())}."
+        )
+
+    for sub in metric.sub_types:
+        if sub.name not in allowed_metrics:
+            raise ValueError(
+                f"Metric sub-type '{sub.name}' is not compatible with task type '{task_type}'. "
+                f"Allowed metrics for '{task_type}': {[m.value for m in allowed_metrics]}."
+            )
 
 
 class OliveEvaluator(ABC):
@@ -83,7 +180,7 @@ class OliveEvaluator(ABC):
         model: "OliveModelHandler",
         metrics: list[Metric],
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         raise NotImplementedError
 
@@ -121,8 +218,6 @@ class OliveEvaluator(ABC):
 
     @staticmethod
     def get_user_config(framework: Framework, metric: Metric):
-        assert metric.user_config, "user_config is not specified in the metric config"
-
         dataloader = None
         eval_func = None
         post_func = None
@@ -130,6 +225,9 @@ class OliveEvaluator(ABC):
         # load the evaluate function
         # priority: evaluate_func > metric_func
         if metric.type == MetricType.CUSTOM:
+            if not metric.user_config:
+                raise ValueError("user_config is required for CUSTOM metric type")
+
             evaluate_func = getattr(metric.user_config, "evaluate_func", None)
             kwargs = getattr(metric.user_config, "evaluate_func_kwargs", None) or {}
             if not evaluate_func:
@@ -162,6 +260,68 @@ class OliveEvaluator(ABC):
         return evaluate_backend_cls().measure(model_outputs, targets, metric)
 
     @staticmethod
+    def save_sample_log(
+        name: str, sample_log_dir: Optional[str], inference_output: "OliveModelOutput", targets: Any, num_samples: int
+    ) -> None:
+        """Save top N sample predictions and ground truth to a JSONL file.
+
+        Each line in the output file is a JSON object with 'index', 'prediction', and 'target'
+        fields. When the inference output carries per-sample ``extras`` (e.g. the input prompt and
+        the vision/audio file name, or lm-eval question/options metadata), those key/value pairs are
+        merged into each record as well. For tensor data, values are converted to Python scalars or
+        lists. The log is written to ``<sample_log_dir>/<name>_samples.jsonl`` (current working
+        directory when ``sample_log_dir`` is not set). This is best-effort: filesystem or
+        serialization errors are logged as warnings.
+        """
+        if num_samples <= 0:
+            return
+
+        try:
+            preds = inference_output.preds
+            extras = getattr(inference_output, "extras", None)
+            output_dir = Path(sample_log_dir) if sample_log_dir else Path.cwd()
+            # Sanitize name to prevent path traversal
+            safe_name = Path(name).name.replace("/", "_").replace("\\", "_") or "metric"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            log_path = output_dir / f"{safe_name}_samples.jsonl"
+
+            def _to_serializable(val):
+                """Convert tensor/ndarray/numpy scalar values to JSON-serializable Python objects."""
+                if isinstance(val, (torch.Tensor, np.ndarray)):
+                    return val.tolist()
+                if isinstance(val, np.generic):
+                    return val.item()
+                return val
+
+            total_samples = len(preds) if hasattr(preds, "__len__") else num_samples
+            n = min(num_samples, total_samples)
+            if num_samples > total_samples:
+                logger.warning(
+                    "sample_log_num (%d) exceeds available samples (%d), capping to %d.",
+                    num_samples,
+                    total_samples,
+                    n,
+                )
+            with log_path.open("w", encoding="utf-8") as f:
+                for i in range(n):
+                    pred_val = preds[i] if hasattr(preds, "__getitem__") else preds
+                    target_val = targets[i] if hasattr(targets, "__getitem__") else targets
+                    record = {"index": i}
+                    # Merge per-sample metadata (e.g. prompt, image/audio file name) when available.
+                    if extras is not None and hasattr(extras, "__getitem__") and i < len(extras):
+                        extra = extras[i]
+                        if isinstance(extra, dict):
+                            for key, value in extra.items():
+                                record[key] = _to_serializable(value)
+                    record["prediction"] = _to_serializable(pred_val)
+                    record["target"] = _to_serializable(target_val)
+                    f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+            logger.info("Saved %d sample predictions to %s", n, log_path)
+        except Exception as e:
+            logger.warning("Failed to save sample log for '%s': %s", name, e)
+
+    @staticmethod
     def latency_helper(latencies) -> dict:
         return {
             LatencySubType.AVG: round(sum(latencies) / len(latencies) * 1000, 5),
@@ -186,7 +346,7 @@ class OliveEvaluator(ABC):
                 priority=sub_type.priority,
                 higher_is_better=sub_type.higher_is_better,
             )
-        return MetricResult.parse_obj(metric_res)
+        return MetricResult.model_validate(metric_res)
 
     @staticmethod
     def compute_throughput(metric: Metric, latencies: Any) -> MetricResult:
@@ -207,7 +367,7 @@ class OliveEvaluator(ABC):
                 priority=sub_type.priority,
                 higher_is_better=sub_type.higher_is_better,
             )
-        return MetricResult.parse_obj(metric_res)
+        return MetricResult.model_validate(metric_res)
 
 
 class _OliveEvaluator(OliveEvaluator):
@@ -217,7 +377,7 @@ class _OliveEvaluator(OliveEvaluator):
 
     @classmethod
     def io_bind_enabled(cls, metric: Metric, inference_settings: dict) -> bool:
-        if metric.user_config.io_bind:
+        if metric.user_config and metric.user_config.io_bind:
             return True
 
         return inference_settings and inference_settings.get("io_bind")
@@ -230,7 +390,7 @@ class _OliveEvaluator(OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> tuple[OliveModelOutput, Any]:
         raise NotImplementedError
 
@@ -242,7 +402,7 @@ class _OliveEvaluator(OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         raise NotImplementedError
 
@@ -254,7 +414,7 @@ class _OliveEvaluator(OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         """For given repeat_test_num, return a list of latencies(ms)."""
         raise NotImplementedError
@@ -266,7 +426,7 @@ class _OliveEvaluator(OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         latencies = self._evaluate_raw_latency(model, metric, dataloader, post_func, device, execution_providers)
         return OliveEvaluator.compute_latency(metric, latencies)
@@ -278,7 +438,7 @@ class _OliveEvaluator(OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         latencies = self._evaluate_raw_latency(model, metric, dataloader, post_func, device, execution_providers)
         return OliveEvaluator.compute_throughput(metric, latencies)
@@ -290,9 +450,9 @@ class _OliveEvaluator(OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
-        return MetricResult.parse_obj(
+        return MetricResult.model_validate(
             {SizeOnDiskSubType.BYTES.value: {"value": model.size_on_disk, "priority": -1, "higher_is_better": False}}
         )
 
@@ -307,7 +467,7 @@ class _OliveEvaluator(OliveEvaluator):
         execution_providers=None,
     ) -> MetricResult:
         raw_res = None
-        if metric.user_config.evaluate_func:
+        if metric.user_config and metric.user_config.evaluate_func:
             raw_res = eval_func(model, device, execution_providers)
         else:
             inference_output, targets = self._inference(
@@ -329,14 +489,14 @@ class _OliveEvaluator(OliveEvaluator):
                     priority=sub_type.priority,
                     higher_is_better=sub_type.higher_is_better,
                 )
-        return MetricResult.parse_obj(metric_res)
+        return MetricResult.model_validate(metric_res)
 
     def evaluate(
         self,
         model: "OliveModelHandler",
         metrics: list[Metric],
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         metrics_res = {}
         for original_metric in metrics:
@@ -386,6 +546,106 @@ class OnnxEvaluatorMixin:
         return inference_settings
 
 
+def _find_genai_config(model: ONNXModelHandler) -> Optional[Path]:
+    """Find genai_config.json by searching upward from the ONNX file's parent directory.
+
+    Returns the Path to genai_config.json if found, or None. Searches at most
+    3 levels up to avoid traversing unrelated directories.
+    """
+    candidate = Path(model.model_path).parent
+    for _ in range(3):
+        genai_path = candidate / "genai_config.json"
+        if genai_path.is_file():
+            return genai_path
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return None
+
+
+def _get_genai_model_dir(model: ONNXModelHandler) -> str:
+    """Get the ORT GenAI model root directory (where genai_config.json lives).
+
+    Falls back to the ONNX file's parent directory if genai_config.json is not found.
+    """
+    genai_config_path = _find_genai_config(model)
+    if genai_config_path is not None:
+        return str(genai_config_path.parent)
+    return str(Path(model.model_path).parent)
+
+
+def _normalize_audio_batch(input_data) -> tuple[list, list]:
+    """Return (audio_arrays, file_names) from the various speech input shapes.
+
+    Supports the ``{"audio": array, "file_name": name}`` dict produced by
+    ``speech_transcription_pre_process`` (single or batched), as well as legacy raw
+    arrays / lists of arrays (in which case file names are ``None``).
+    """
+    arrays: list = []
+    names: list = []
+
+    def _add_array(arr, name):
+        arr = np.array(arr) if not isinstance(arr, np.ndarray) else arr
+        if arr.ndim <= 1:
+            arrays.append(arr)
+            names.append(name)
+        else:
+            for i in range(arr.shape[0]):
+                arrays.append(arr[i])
+                names.append(name)
+
+    dict_items = None
+    if isinstance(input_data, dict):
+        dict_items = [input_data]
+    elif isinstance(input_data, list) and input_data and all(isinstance(d, dict) for d in input_data):
+        dict_items = input_data
+
+    if dict_items is not None:
+        for item in dict_items:
+            _add_array(item.get("audio"), item.get("file_name"))
+        return arrays, names
+
+    # Legacy shapes: raw array/tensor or list of arrays.
+    if isinstance(input_data, (np.ndarray, torch.Tensor)):
+        arr = np.array(input_data) if isinstance(input_data, torch.Tensor) else input_data
+        _add_array(arr, None)
+    elif isinstance(input_data, list):
+        for a in input_data:
+            _add_array(a, None)
+    return arrays, names
+
+
+def _is_multimodal_lm_genai(genai_cfg: Optional[dict]) -> bool:
+    """Return True for chat-style multimodal LMs that accept an audio input (e.g. gemma4).
+
+    These models are not dedicated ASR heads like whisper/nemotron_speech; they are
+    instruction-tuned decoders prompted with an ``<|audio|>`` chat turn. They are detected
+    by the presence of an audio component (``speech``/``audio``) in the genai config's
+    ``model`` section.
+    """
+    if not genai_cfg:
+        return False
+    model_cfg = genai_cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        return False
+    return any(key in model_cfg for key in ("speech", "audio"))
+
+
+def _unwrap_audio_input(input_data):
+    """Strip the speech metadata dict down to the raw audio array(s).
+
+    Keeps the non-genai inference/latency paths (which feed ``format_data``) working with the
+    ``{"audio": array, "file_name": name}`` shape produced by ``speech_transcription_pre_process``.
+    Other input shapes are returned unchanged.
+    """
+    if isinstance(input_data, dict) and "audio" in input_data:
+        return input_data["audio"]
+    if isinstance(input_data, list) and input_data and all(isinstance(d, dict) and "audio" in d for d in input_data):
+        return [d["audio"] for d in input_data]
+    return input_data
+
+
 @Registry.register(str(Framework.ONNX))
 @Registry.register("OnnxEvaluator")
 class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
@@ -409,7 +669,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         # prepare for io binding
         io_config = model.io_config
         io_bind = OnnxEvaluator.io_bind_enabled(metric, model.inference_settings)
-        shared_kv_buffer = metric.user_config.shared_kv_buffer
+        shared_kv_buffer = getattr(metric.user_config, "shared_kv_buffer", None) if metric.user_config else None
         use_fp16 = any(v == "float16" for v in io_config["input_types"])
         input_feed = None
         if io_bind and shared_kv_buffer and use_fp16:
@@ -442,7 +702,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> tuple[OliveModelOutput, Any]:
         session, inference_settings = OnnxEvaluator.get_session_wrapper(
             model, metric, dataloader, device, execution_providers
@@ -486,6 +746,24 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
             dump_tuning_result(session.session, tuning_result_file)
         return OliveModelOutput(preds=preds, logits=logits), targets
 
+    @staticmethod
+    def _load_genai_config(model: ONNXModelHandler) -> Optional[dict]:
+        """Load genai_config.json from the model directory, or return None if not found.
+
+        Searches upward from the ONNX file's parent directory to support nested
+        multi-component model layouts (e.g. ``models/decoder/model.onnx`` where
+        ``genai_config.json`` lives at ``models/``).
+        """
+        genai_config_path = _find_genai_config(model)
+        if genai_config_path is None:
+            return None
+
+        try:
+            with genai_config_path.open(encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in genai config file: {genai_config_path}") from e
+
     def _evaluate_onnx_accuracy(
         self,
         model: ONNXModelHandler,
@@ -493,10 +771,675 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
-        inference_output, targets = self._inference(model, metric, dataloader, post_func, device, execution_providers)
+        if _is_vision_metric(metric):
+            _validate_vision_task_metric(metric)
+            # Auto-detect genai vision model by checking for genai_config.json with vision field
+            genai_cfg = self._load_genai_config(model)
+            use_genai_vision = genai_cfg is not None and "vision" in genai_cfg.get("model", {})
+
+            if use_genai_vision:
+                inference_output, targets = self._inference_vision_genai(model, dataloader, device)
+            else:
+                inference_output, targets = self._inference_vision(
+                    model, metric, dataloader, post_func, device, execution_providers
+                )
+        elif _is_text_based_metric(metric):
+            # Auto-detect genai model by checking for genai_config.json
+            genai_cfg = self._load_genai_config(model)
+            if genai_cfg:
+                model_type = genai_cfg.get("model", {}).get("type", "")
+
+                if model_type == "whisper":
+                    inference_output, targets = self._inference_text_genai(
+                        model, metric, dataloader, device, execution_providers
+                    )
+                elif model_type == "nemotron_speech":
+                    inference_output, targets = self._inference_text_genai_streaming(
+                        model, metric, dataloader, device, execution_providers
+                    )
+                elif _is_multimodal_lm_genai(genai_cfg):
+                    inference_output, targets = self._inference_text_genai_multimodal(
+                        model, metric, dataloader, device, execution_providers
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported genai model type '{model_type}' for speech evaluation. "
+                        f"Supported types: 'whisper' (offline), 'nemotron_speech' (streaming), "
+                        f"and chat-style multimodal LMs with an audio input (e.g. 'gemma4'). "
+                        f"For unsupported model types, use a custom evaluation script."
+                    )
+            else:
+                inference_output, targets = self._inference_text(
+                    model, metric, dataloader, post_func, device, execution_providers
+                )
+        else:
+            inference_output, targets = self._inference(
+                model, metric, dataloader, post_func, device, execution_providers
+            )
+        OliveEvaluator.save_sample_log(
+            metric.name, metric.sample_log_dir, inference_output, targets, metric.sample_log_num
+        )
         return OliveEvaluator.compute_accuracy(metric, inference_output, targets)
+
+    def _inference_text(
+        self,
+        model: ONNXModelHandler,
+        metric: Metric,
+        dataloader: "DataLoader",
+        post_func=None,
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Text-based inference for speech/ASR metrics (WER, RTFx).
+
+        The post_func must return a list of predicted text strings per batch.
+        Labels from the dataloader must be a list of reference text strings.
+        Tracks total inference time and audio duration for RTFx computation.
+        """
+        session, inference_settings = OnnxEvaluator.get_session_wrapper(
+            model, metric, dataloader, device, execution_providers
+        )
+        io_config = model.io_config
+        run_kwargs = metric.get_run_kwargs()
+
+        all_preds = []
+        all_targets = []
+        total_audio_duration = 0.0
+        total_inference_time = 0.0
+        output_names = io_config["output_names"]
+        is_single_tensor_output = len(output_names) == 1
+        sample_rate = (
+            metric.data_config.pre_process_data_config.params.get("sample_rate", 16000)
+            if (metric.data_config and metric.data_config.pre_process_data_config)
+            else 16000
+        )
+
+        for batch in dataloader:
+            input_data, labels = OliveEvaluator.unpack_batch_for_accuracy(batch)
+            # Drop any speech metadata (e.g. file_name) so format_data receives raw audio arrays.
+            input_data = _unwrap_audio_input(input_data)
+            # Track audio duration from input data
+            if isinstance(input_data, (np.ndarray, torch.Tensor)):
+                audio_samples = input_data.shape[-1] if len(input_data.shape) > 1 else input_data.shape[0]
+                total_audio_duration += audio_samples / sample_rate
+            elif isinstance(input_data, dict):
+                for v in input_data.values():
+                    if isinstance(v, (np.ndarray, torch.Tensor)) and v.ndim >= 1:
+                        total_audio_duration += v.shape[-1] / sample_rate
+                        break
+
+            input_feed = format_data(input_data, io_config)
+            start_time = time.perf_counter()
+            result = model.run_session(session, input_feed, **run_kwargs)
+            if is_single_tensor_output:
+                result = torch.from_numpy(result[0]) if hasattr(result[0], "__array__") else torch.tensor(result[0])
+            else:
+                result = {
+                    name: torch.from_numpy(result[i]) if hasattr(result[i], "__array__") else torch.tensor(result[i])
+                    for i, name in enumerate(output_names)
+                }
+            # post_func must decode model output to text strings
+            outputs = post_func(result) if post_func else result
+            total_inference_time += time.perf_counter() - start_time
+
+            if isinstance(outputs, str):
+                all_preds.append(outputs)
+            elif isinstance(outputs, (list, tuple)):
+                if not outputs:
+                    continue
+                if not isinstance(outputs[0], str):
+                    raise ValueError(
+                        f"post_func must return str or list[str] for text-based metrics (WER), "
+                        f"but got list of {type(outputs[0]).__name__}. "
+                        f"Ensure your post_func decodes model output to text."
+                    )
+                all_preds.extend(outputs)
+            else:
+                raise ValueError(
+                    f"post_func must return str or list[str] for text-based metrics (WER), "
+                    f"but got {type(outputs).__name__}. "
+                    f"Ensure your post_func decodes model output to text."
+                )
+            # labels should be reference text strings
+            if isinstance(labels, (list, tuple)):
+                all_targets.extend(labels)
+            else:
+                all_targets.append(labels)
+
+        tuning_result_file = inference_settings.get("tuning_result_file")
+        if tuning_result_file:
+            dump_tuning_result(session.session, tuning_result_file)
+
+        # Store timing metadata for RTFx computation
+        timing_metadata = {
+            "total_audio_duration": total_audio_duration,
+            "total_inference_time": total_inference_time,
+        }
+        return OliveModelOutput(preds=all_preds, logits=timing_metadata), all_targets
+
+    def _inference_vision(
+        self,
+        model: ONNXModelHandler,
+        metric: Metric,
+        dataloader: "DataLoader",
+        post_func=None,
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Vision-based inference for VQA/OCR metrics (exact_match, relaxed_accuracy, word_sort_ratio).
+
+        The post_func must return predicted answer strings per batch.
+        Labels from the dataloader must be reference answer strings.
+        """
+        session, inference_settings = OnnxEvaluator.get_session_wrapper(
+            model, metric, dataloader, device, execution_providers
+        )
+        io_config = model.io_config
+        run_kwargs = metric.get_run_kwargs()
+
+        all_preds = []
+        all_targets = []
+        output_names = io_config["output_names"]
+        is_single_tensor_output = len(output_names) == 1
+
+        # Note: This assumes the model produces the full answer in a single forward pass
+        # (e.g., classification-style VQA models). For autoregressive generation models,
+        # use the PyTorch evaluator with a generation loop in post_func instead.
+        for batch in dataloader:
+            input_data, labels = OliveEvaluator.unpack_batch_for_accuracy(batch)
+            input_feed = format_data(input_data, io_config)
+            result = model.run_session(session, input_feed, **run_kwargs)
+            if is_single_tensor_output:
+                result = torch.from_numpy(result[0]) if hasattr(result[0], "__array__") else torch.tensor(result[0])
+            else:
+                result = {
+                    name: torch.from_numpy(result[i]) if hasattr(result[i], "__array__") else torch.tensor(result[i])
+                    for i, name in enumerate(output_names)
+                }
+            # post_func must decode model output to answer strings
+            outputs = post_func(result) if post_func else result
+            if isinstance(outputs, str):
+                all_preds.append(outputs)
+            elif isinstance(outputs, (list, tuple)):
+                if not outputs:
+                    continue
+                if not isinstance(outputs[0], str):
+                    raise ValueError(
+                        f"post_func must return str or list[str] for vision metrics, "
+                        f"but got list of {type(outputs[0]).__name__}. "
+                        f"Ensure your post_func decodes model output to answer text."
+                    )
+                all_preds.extend(outputs)
+            else:
+                raise ValueError(
+                    f"post_func must return str or list[str] for vision metrics, "
+                    f"but got {type(outputs).__name__}. "
+                    f"Ensure your post_func decodes model output to answer text."
+                )
+            # labels should be reference answer strings
+            if isinstance(labels, (list, tuple)):
+                all_targets.extend(labels)
+            else:
+                all_targets.append(labels)
+
+        tuning_result_file = inference_settings.get("tuning_result_file")
+        if tuning_result_file:
+            dump_tuning_result(session.session, tuning_result_file)
+
+        return OliveModelOutput(preds=all_preds, logits=None), all_targets
+
+    def _inference_vision_genai(
+        self,
+        model: ONNXModelHandler,
+        dataloader: "DataLoader",
+        device: Device = Device.CPU,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Vision-based inference for VQA/OCR metrics using onnxruntime-genai.
+
+        Auto-detected when the model directory contains genai_config.json with a vision field.
+        Uses og.Model with multimodal processor for vision-language models (e.g., Qwen3-VL).
+        The dataloader must yield (input_dict, labels) where input_dict contains
+        'image' (PIL Image) and 'question' (str), and labels are reference answer strings.
+
+        Note: GPU/CPU selection is driven by the `device` parameter. onnxruntime-genai uses
+        short provider names internally (e.g., "cuda") which differ from ORT-style EP names.
+        """
+        try:
+            import onnxruntime_genai as og
+        except ImportError as e:
+            raise ImportError(
+                "onnxruntime-genai is required for genai-based vision evaluation. "
+                "Install it with: pip install onnxruntime-genai"
+            ) from e
+
+        import re
+        import tempfile
+
+        try:
+            from PIL import Image
+        except ImportError as e:
+            raise ImportError("Pillow is required for vision evaluation. Install it with: pip install Pillow") from e
+
+        model_dir = _get_genai_model_dir(model)
+
+        # Default max_length; can be overridden per-sample from the data config.
+        default_max_length = 4096
+
+        # Build og.Model with appropriate execution provider
+        # Note: onnxruntime-genai uses CPU by default when no provider is appended.
+        # Only non-CPU providers need to be explicitly added using short names (e.g., "cuda").
+        # This follows the same pattern as _inference_text_genai and _inference_text_genai_streaming.
+        config = og.Config(model_dir)
+        config.clear_providers()
+        if device == Device.GPU:
+            config.append_provider("cuda")
+        og_model = og.Model(config)
+        processor = og_model.create_multimodal_processor()
+        tokenizer = og.Tokenizer(og_model)
+
+        all_preds = []
+        all_targets = []
+        all_extras = []
+
+        # Use a temporary directory for image files to avoid per-file create/delete overhead
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_img_path = Path(tmp_dir) / "input.png"
+
+            sample_idx = 0
+            for batch in dataloader:
+                input_data, labels = OliveEvaluator.unpack_batch_for_accuracy(batch)
+
+                # input_data is a dict with 'image' (PIL) and 'question' (str)
+                # or a list of such dicts for batch_size > 1
+                items = [input_data] if isinstance(input_data, dict) else input_data
+
+                for item in items:
+                    pil_image = item.get("image")
+                    question = item.get("question", "")
+                    sys_prompt = item.get("system_prompt", "")
+                    num_choices = item.get("num_choices", 0)
+                    max_length = item.get("max_length", default_max_length)
+                    file_name = item.get("file_name", str(sample_idx))
+
+                    if pil_image is None:
+                        # Append empty pred to maintain alignment with targets
+                        all_preds.append("")
+                        all_extras.append({"prompt": question, "image": file_name})
+                        sample_idx += 1
+                        continue
+
+                    try:
+                        # Ensure PIL Image
+                        if not isinstance(pil_image, Image.Image):
+                            with Image.open(pil_image) as img:
+                                pil_image = img.convert("RGB")
+
+                        # Build chat messages for the vision-language model
+                        messages = []
+                        if sys_prompt:
+                            messages.append({"role": "system", "content": sys_prompt})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image"},
+                                    {"type": "text", "text": question},
+                                ],
+                            }
+                        )
+                        messages_json = json.dumps(messages)
+
+                        # Save image to temp file for og.Images (reuse same path to minimize I/O)
+                        pil_image.save(str(tmp_img_path), format="PNG")
+                        images = og.Images.open(str(tmp_img_path))
+
+                        prompt = tokenizer.apply_chat_template(messages_json, add_generation_prompt=True)
+                        inputs = processor(prompt, images=images)
+
+                        # Remove audio_features if present but not needed (vision-only inference)
+                        # to avoid "Model output was not found: audio_features" errors
+                        if "audio_features" in inputs:
+                            del inputs["audio_features"]
+
+                        params = og.GeneratorParams(og_model)
+                        params.set_search_options(max_length=max_length, do_sample=False)
+
+                        generator = og.Generator(og_model, params)
+                        generator.set_inputs(inputs)
+
+                        tokens = []
+                        while not generator.is_done():
+                            generator.generate_next_token()
+                            tokens.append(generator.get_next_tokens()[0])
+                        del generator
+
+                        pred = tokenizer.decode(tokens).strip()
+                    except Exception as e:
+                        logger.warning("Skipping sample %d due to error: %s", sample_idx, e)
+                        pred = ""
+
+                    sample_idx += 1
+
+                    # For multiple-choice tasks, extract the answer digit from responses
+                    # like "2", "The answer is 3", or "1. D" to match the expected answer format.
+                    # Only enabled when num_choices is between 1 and 9 (single-digit options).
+                    if 1 <= num_choices <= 9 and pred:
+                        pattern = rf"\b([1-{num_choices}])\b"
+                        num_match = re.search(pattern, pred)
+                        if num_match:
+                            pred = num_match.group(1)
+                        else:
+                            # Fallback: find any single digit in the valid range
+                            valid_digits = {str(d) for d in range(1, num_choices + 1)}
+                            for ch in pred:
+                                if ch in valid_digits:
+                                    pred = ch
+                                    break
+                    all_preds.append(pred)
+                    all_extras.append({"prompt": question, "image": file_name})
+
+                # Collect reference texts (aligned with preds including empty ones for None images)
+                if isinstance(labels, (list, tuple)):
+                    all_targets.extend(labels)
+                else:
+                    all_targets.append(labels)
+
+        del og_model
+
+        return OliveModelOutput(preds=all_preds, logits=None, extras=all_extras), all_targets
+
+    def _load_genai_speech_model(self, model: ONNXModelHandler, device: Device):
+        """Load an ORT GenAI model for speech evaluation.
+
+        Returns ``(og, og_model, genai_config, model_dir)`` where ``og`` is the imported
+        ``onnxruntime_genai`` module. Shared by the whisper, streaming, and multimodal-LM
+        speech inference paths to avoid duplicating the import guard, genai_config load, and
+        execution-provider selection.
+        """
+        try:
+            import onnxruntime_genai as og
+        except ImportError:
+            raise ImportError(
+                "onnxruntime-genai is required for genai-based speech evaluation. "
+                "Install it with: pip install onnxruntime-genai"
+            ) from None
+
+        model_dir = _get_genai_model_dir(model)
+        with (Path(model_dir) / "genai_config.json").open() as f:
+            genai_config = json.load(f)
+
+        config = og.Config(model_dir)
+        config.clear_providers()
+        if device == Device.GPU:
+            config.append_provider("cuda")
+        og_model = og.Model(config)
+        return og, og_model, genai_config, model_dir
+
+    @staticmethod
+    def _run_speech_inference_loop(dataloader, sample_rate, transcribe_fn):
+        """Run the shared speech-eval batch loop.
+
+        Iterates batches, normalizes audio, times inference, transcribes each clip via
+        ``transcribe_fn(audio_array) -> str``, and collects predictions, per-sample audio
+        names, and reference texts. Returns ``(OliveModelOutput, targets)`` with RTFx timing
+        metadata in ``logits``. Only the per-clip ``transcribe_fn`` differs between the
+        whisper, streaming, and multimodal-LM speech paths.
+        """
+        all_preds = []
+        all_targets = []
+        all_extras = []
+        total_audio_duration = 0.0
+        total_inference_time = 0.0
+
+        for batch in dataloader:
+            input_data, labels = OliveEvaluator.unpack_batch_for_accuracy(batch)
+
+            # Convert input to list of audio arrays (with optional file names)
+            audio_arrays, audio_names = _normalize_audio_batch(input_data)
+            if not audio_arrays:
+                continue
+
+            start_time = time.perf_counter()
+            for arr, name in zip(audio_arrays, audio_names):
+                total_audio_duration += len(arr) / sample_rate
+                all_preds.append(transcribe_fn(arr))
+                all_extras.append({"audio": name if name is not None else str(len(all_extras))})
+            total_inference_time += time.perf_counter() - start_time
+
+            # Collect reference texts
+            if isinstance(labels, (list, tuple)):
+                all_targets.extend(labels)
+            else:
+                all_targets.append(labels)
+
+        timing_metadata = {
+            "total_audio_duration": total_audio_duration,
+            "total_inference_time": total_inference_time,
+        }
+        return OliveModelOutput(preds=all_preds, logits=timing_metadata, extras=all_extras), all_targets
+
+    def _inference_text_genai(
+        self,
+        model: ONNXModelHandler,
+        metric: Metric,
+        dataloader: "DataLoader",
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Text-based inference for speech/ASR metrics using onnxruntime-genai.
+
+        Auto-detected when the model directory contains genai_config.json.
+        Uses og.Model with multimodal processor for Whisper-style models.
+        Automatically chunks audio longer than 30 seconds.
+        """
+        import io
+
+        import soundfile as sf
+
+        og, og_model, genai_config, _ = self._load_genai_speech_model(model, device)
+        processor = og_model.create_multimodal_processor()
+
+        # Determine decoder prompt tokens from model config
+        # English-only models (vocab_size=51864) use shorter prompt
+        vocab_size = genai_config.get("model", {}).get("vocab_size", 51865)
+        is_english_only = vocab_size == 51864
+        if is_english_only:
+            decoder_prompt_tokens = ["<|startoftranscript|>", "<|notimestamps|>"]
+        else:
+            decoder_prompt_tokens = ["<|startoftranscript|>", "<|en|>", "<|transcribe|>", "<|notimestamps|>"]
+
+        sample_rate = (
+            metric.data_config.pre_process_data_config.params.get("sample_rate", 16000)
+            if (metric.data_config and metric.data_config.pre_process_data_config)
+            else 16000
+        )
+        max_length = genai_config.get("search", {}).get("max_length", 448)
+
+        # Whisper encoder supports max 30s (3000 mel frames)
+        max_chunk_seconds = 30
+        max_chunk_samples = max_chunk_seconds * sample_rate
+
+        prompt = "".join(decoder_prompt_tokens)
+
+        def _transcribe_chunks(audio_arr: np.ndarray) -> str:
+            """Transcribe a single audio array, chunking if longer than 30s."""
+            if len(audio_arr) <= max_chunk_samples:
+                chunks = [audio_arr]
+            else:
+                # Split into non-overlapping 30s chunks
+                chunks = []
+                for start in range(0, len(audio_arr), max_chunk_samples):
+                    chunks.append(audio_arr[start : start + max_chunk_samples])
+
+            transcriptions = []
+            for chunk in chunks:
+                buffer = io.BytesIO()
+                sf.write(buffer, chunk, samplerate=sample_rate, format="WAV")
+                audios = og.Audios.open_bytes(buffer.getvalue())
+                inputs = processor([prompt], audios=audios)
+
+                params = og.GeneratorParams(og_model)
+                params.set_search_options(do_sample=False, max_length=max_length, min_length=0, batch_size=1)
+
+                generator = og.Generator(og_model, params)
+                generator.set_inputs(inputs)
+
+                while not generator.is_done():
+                    generator.generate_next_token()
+
+                tokens = generator.get_sequence(0)
+                transcriptions.append(processor.decode(tokens).strip())
+
+            return " ".join(transcriptions)
+
+        return self._run_speech_inference_loop(dataloader, sample_rate, _transcribe_chunks)
+
+    def _inference_text_genai_multimodal(
+        self,
+        model: ONNXModelHandler,
+        metric: Metric,
+        dataloader: "DataLoader",
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Text-based ASR inference for chat-style multimodal LMs (e.g. gemma4) via onnxruntime-genai.
+
+        Unlike whisper/nemotron_speech, these models are instruction-tuned decoders: the audio is
+        wrapped in an ``<|audio|>`` chat turn built from the model's ``chat_template.jinja`` and a
+        configurable system prompt + instruction, then decoded greedily. Only the newly generated
+        tokens (after the prompt) are returned as the transcription.
+
+        The system prompt and instruction can be overridden via the metric's pre-process params
+        (``system_prompt`` / ``instruction``); they default to a strict ASR prompt that suppresses
+        chat-style refusals which would otherwise inflate WER.
+        """
+        import io
+
+        import soundfile as sf
+
+        og, og_model, genai_config, model_dir = self._load_genai_speech_model(model, device)
+        processor = og_model.create_multimodal_processor()
+        tokenizer = og.Tokenizer(og_model)
+
+        pre_process_params = (
+            metric.data_config.pre_process_data_config.params
+            if (metric.data_config and metric.data_config.pre_process_data_config)
+            else {}
+        )
+        sample_rate = pre_process_params.get("sample_rate", 16000)
+        default_system = (
+            "You are an automatic speech recognition (ASR) system. "
+            "Output only the exact verbatim transcript of the speech in the audio. "
+            "Do not add commentary, explanations, or apologies. "
+            "If unsure, output your best guess."
+        )
+        system_prompt = pre_process_params.get("system_prompt", default_system)
+        instruction = pre_process_params.get("instruction", "Transcribe the audio verbatim.")
+        max_length = genai_config.get("search", {}).get("max_length", 1024)
+
+        # Build the chat prompt once (audio is injected per-sample via the processor).
+        chat_template_path = Path(model_dir) / "chat_template.jinja"
+        template_str = chat_template_path.read_text(encoding="utf-8") if chat_template_path.exists() else None
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": instruction}]},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            json.dumps(messages), template_str=template_str, tools="", add_generation_prompt=True
+        )
+
+        def _transcribe(audio_arr: np.ndarray) -> str:
+            buffer = io.BytesIO()
+            sf.write(buffer, np.asarray(audio_arr, dtype=np.float32), samplerate=sample_rate, format="WAV")
+            audios = og.Audios.open_bytes(buffer.getvalue())
+            inputs = processor(prompt, audios=audios)
+
+            params = og.GeneratorParams(og_model)
+            params.set_search_options(
+                do_sample=False, max_length=max_length, min_length=0, past_present_share_buffer=False
+            )
+            generator = og.Generator(og_model, params)
+            generator.set_inputs(inputs)
+
+            prompt_len = generator.token_count()
+            while not generator.is_done():
+                generator.generate_next_token()
+
+            new_tokens = list(generator.get_sequence(0)[prompt_len:])
+            return tokenizer.decode(new_tokens).strip()
+
+        return self._run_speech_inference_loop(dataloader, sample_rate, _transcribe)
+
+    def _inference_text_genai_streaming(
+        self,
+        model: ONNXModelHandler,
+        metric: Metric,
+        dataloader: "DataLoader",
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Text-based inference for streaming ASR models using onnxruntime-genai.
+
+        Auto-detected when genai_config.json has model.type = "nemotron_speech".
+        Uses og.StreamingProcessor for stateful chunked inference with silence padding
+        for right-context flushing.
+        """
+        og, og_model, genai_config, _ = self._load_genai_speech_model(model, device)
+        tokenizer = og.Tokenizer(og_model)
+
+        sample_rate = genai_config["model"].get("sample_rate", 16000)
+        chunk_samples = genai_config["model"].get("chunk_samples", 8960)
+
+        # Number of silence chunks for right-context flushing
+        num_silence_chunks = 4
+
+        def _transcribe_streaming(audio_arr: np.ndarray) -> str:
+            """Transcribe audio using stateful streaming processor."""
+            audio = audio_arr.astype(np.float32)
+            stream_processor = og.StreamingProcessor(og_model)
+            tokenizer_stream = tokenizer.create_stream()
+            params = og.GeneratorParams(og_model)
+            generator = og.Generator(og_model, params)
+
+            transcript = ""
+
+            def decode_tokens():
+                nonlocal transcript
+                while not generator.is_done():
+                    generator.generate_next_token()
+                    tokens = generator.get_next_tokens()
+                    if len(tokens) > 0:
+                        text = tokenizer_stream.decode(tokens[0])
+                        if text:
+                            transcript += text
+
+            # Feed audio chunks
+            for start in range(0, len(audio), chunk_samples):
+                chunk = audio[start : start + chunk_samples].astype(np.float32)
+                inputs = stream_processor.process(chunk)
+                if inputs is not None:
+                    generator.set_inputs(inputs)
+                    decode_tokens()
+
+            # Flush remaining audio in the processor
+            inputs = stream_processor.flush()
+            if inputs is not None:
+                generator.set_inputs(inputs)
+                decode_tokens()
+
+            # Feed silence chunks for right-context flushing
+            for _ in range(num_silence_chunks):
+                silence = np.zeros(chunk_samples, dtype=np.float32)
+                inputs = stream_processor.process(silence)
+                if inputs is not None:
+                    generator.set_inputs(inputs)
+                    decode_tokens()
+
+            return transcript
+
+        return self._run_speech_inference_loop(dataloader, sample_rate, _transcribe_streaming)
 
     def _evaluate_onnx_latency(
         self,
@@ -505,7 +1448,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         warmup_num, repeat_test_num, sleep_num = get_latency_config_from_metric(metric)
         session, inference_settings = OnnxEvaluator.get_session_wrapper(
@@ -515,6 +1458,8 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
 
         batch = next(iter(dataloader))
         input_data = OliveEvaluator.extract_input_data(batch)
+        # Strip speech metadata (e.g. file_name) so format_data receives raw audio arrays.
+        input_data = _unwrap_audio_input(input_data)
         input_feed = format_data(input_data, io_config)
 
         latencies = session.time_run(
@@ -611,6 +1556,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         targets = [x for _, t, _ in results for x in t]
         logits = [x for _, _, logit in results for x in logit]
         model_output = OliveModelOutput(preds, logits)
+        OliveEvaluator.save_sample_log(metric.name, metric.sample_log_dir, model_output, targets, metric.sample_log_num)
         return OliveEvaluator.compute_accuracy(metric, model_output, targets)
 
     @staticmethod
@@ -645,7 +1591,9 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         batch = next(iter(dataloader))
         input_data = OliveEvaluator.extract_input_data(batch)
         input_feed = format_data(input_data, io_config)
-        kv_cache_ortvalues = {} if metric.user_config.shared_kv_buffer else None
+        kv_cache_ortvalues = (
+            {} if (metric.user_config and getattr(metric.user_config, "shared_kv_buffer", None)) else None
+        )
 
         io_bind = OnnxEvaluator.io_bind_enabled(metric, model.inference_settings)
         if io_bind:
@@ -653,7 +1601,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
                 session,
                 input_feed,
                 Device.GPU,
-                shared_kv_buffer=metric.user_config.shared_kv_buffer,
+                shared_kv_buffer=getattr(metric.user_config, "shared_kv_buffer", None) if metric.user_config else None,
                 kv_cache_ortvalues=kv_cache_ortvalues,
             )
         latencies = []
@@ -709,7 +1657,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         if isinstance(model, ONNXModelHandler):
             return self._evaluate_onnx_accuracy(model, metric, dataloader, post_func, device, execution_providers)
@@ -727,7 +1675,7 @@ class OnnxEvaluator(_OliveEvaluator, OnnxEvaluatorMixin):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         if isinstance(model, ONNXModelHandler):
             return self._evaluate_onnx_latency(model, metric, dataloader, post_func, device, execution_providers)
@@ -750,7 +1698,7 @@ class PyTorchEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> tuple[OliveModelOutput, Any]:
         session = model.prepare_session()
         preds = []
@@ -797,10 +1745,155 @@ class PyTorchEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
-        inference_output, targets = self._inference(model, metric, dataloader, post_func, device, execution_providers)
+        if _is_vision_metric(metric):
+            _validate_vision_task_metric(metric)
+            inference_output, targets = self._inference_vision(
+                model, metric, dataloader, post_func, device, execution_providers
+            )
+        elif _is_text_based_metric(metric):
+            inference_output, targets = self._inference_text(
+                model, metric, dataloader, post_func, device, execution_providers
+            )
+        else:
+            inference_output, targets = self._inference(
+                model, metric, dataloader, post_func, device, execution_providers
+            )
+        OliveEvaluator.save_sample_log(
+            metric.name, metric.sample_log_dir, inference_output, targets, metric.sample_log_num
+        )
         return OliveEvaluator.compute_accuracy(metric, inference_output, targets)
+
+    @torch.no_grad()
+    def _inference_text(
+        self,
+        model: "PyTorchModelHandler",
+        metric: Metric,
+        dataloader: "DataLoader",
+        post_func=None,
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Text-based inference for speech/ASR metrics (WER, RTFx)."""
+        session = model.prepare_session()
+        all_preds = []
+        all_targets = []
+        total_audio_duration = 0.0
+        total_inference_time = 0.0
+        device = _OliveEvaluator.device_string_to_torch_device(device)
+        run_kwargs = metric.get_run_kwargs()
+        session.to(device)
+        sample_rate = (
+            metric.data_config.pre_process_data_config.params.get("sample_rate", 16000)
+            if (metric.data_config and metric.data_config.pre_process_data_config)
+            else 16000
+        )
+
+        for batch in dataloader:
+            input_data_i, labels = OliveEvaluator.unpack_batch_for_accuracy(batch)
+            # Track audio duration from input data
+            if isinstance(input_data_i, (np.ndarray, torch.Tensor)):
+                audio_samples = input_data_i.shape[-1] if len(input_data_i.shape) > 1 else input_data_i.shape[0]
+                total_audio_duration += audio_samples / sample_rate
+            elif isinstance(input_data_i, dict):
+                for v in input_data_i.values():
+                    if isinstance(v, (np.ndarray, torch.Tensor)) and v.ndim >= 1:
+                        total_audio_duration += v.shape[-1] / sample_rate
+                        break
+
+            input_data = tensor_data_to_device(input_data_i, device)
+            start_time = time.perf_counter()
+            result = model.run_session(session, input_data, **run_kwargs)
+            outputs = post_func(result) if post_func else result
+            total_inference_time += time.perf_counter() - start_time
+
+            if isinstance(outputs, str):
+                all_preds.append(outputs)
+            elif isinstance(outputs, (list, tuple)):
+                if not outputs:
+                    continue
+                if not isinstance(outputs[0], str):
+                    raise ValueError(
+                        f"post_func must return str or list[str] for text-based metrics (WER), "
+                        f"but got list of {type(outputs[0]).__name__}. "
+                        f"Ensure your post_func decodes model output to text."
+                    )
+                all_preds.extend(outputs)
+            else:
+                raise ValueError(
+                    f"post_func must return str or list[str] for text-based metrics (WER), "
+                    f"but got {type(outputs).__name__}. "
+                    f"Ensure your post_func decodes model output to text."
+                )
+            if isinstance(labels, (list, tuple)):
+                all_targets.extend(labels)
+            else:
+                all_targets.append(labels)
+        if device:
+            session.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        timing_metadata = {
+            "total_audio_duration": total_audio_duration,
+            "total_inference_time": total_inference_time,
+        }
+        return OliveModelOutput(preds=all_preds, logits=timing_metadata), all_targets
+
+    @torch.no_grad()
+    def _inference_vision(
+        self,
+        model: "PyTorchModelHandler",
+        metric: Metric,
+        dataloader: "DataLoader",
+        post_func=None,
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> tuple[OliveModelOutput, Any]:
+        """Vision-based inference for VQA/OCR metrics (exact_match, relaxed_accuracy, word_sort_ratio)."""
+        session = model.prepare_session()
+        all_preds = []
+        all_targets = []
+        torch_device = _OliveEvaluator.device_string_to_torch_device(device)
+        run_kwargs = metric.get_run_kwargs()
+        session.to(torch_device)
+
+        for batch in dataloader:
+            input_data_i, labels = OliveEvaluator.unpack_batch_for_accuracy(batch)
+            input_data = tensor_data_to_device(input_data_i, torch_device)
+            result = model.run_session(session, input_data, **run_kwargs)
+            outputs = post_func(result) if post_func else result
+
+            if isinstance(outputs, str):
+                all_preds.append(outputs)
+            elif isinstance(outputs, (list, tuple)):
+                if not outputs:
+                    continue
+                if not isinstance(outputs[0], str):
+                    raise ValueError(
+                        f"post_func must return str or list[str] for vision metrics, "
+                        f"but got list of {type(outputs[0]).__name__}. "
+                        f"Ensure your post_func decodes model output to answer text."
+                    )
+                all_preds.extend(outputs)
+            else:
+                raise ValueError(
+                    f"post_func must return str or list[str] for vision metrics, "
+                    f"but got {type(outputs).__name__}. "
+                    f"Ensure your post_func decodes model output to answer text."
+                )
+            if isinstance(labels, (list, tuple)):
+                all_targets.extend(labels)
+            else:
+                all_targets.append(labels)
+
+        if torch_device:
+            session.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return OliveModelOutput(preds=all_preds, logits=None), all_targets
 
     @torch.no_grad()
     def _evaluate_raw_latency(
@@ -810,7 +1903,7 @@ class PyTorchEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         # pylint: disable=expression-not-assigned
         warmup_num, repeat_test_num, _ = get_latency_config_from_metric(metric)
@@ -874,7 +1967,7 @@ class OpenVINOEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> tuple[OliveModelOutput, Any]:
         session = model.prepare_session(
             inference_settings=metric.get_inference_settings(Framework.OPENVINO.lower()), device=device
@@ -901,9 +1994,12 @@ class OpenVINOEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         inference_output, targets = self._inference(model, metric, dataloader, post_func, device, execution_providers)
+        OliveEvaluator.save_sample_log(
+            metric.name, metric.sample_log_dir, inference_output, targets, metric.sample_log_num
+        )
         return OliveEvaluator.compute_accuracy(metric, inference_output, targets)
 
     def _evaluate_raw_latency(
@@ -913,7 +2009,7 @@ class OpenVINOEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         session = model.prepare_session(
             inference_settings=metric.get_inference_settings(Framework.OPENVINO.lower()), device=device
@@ -939,7 +2035,7 @@ class QNNEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> tuple[OliveModelOutput, Any]:
         dataloader = self._prepare_dataloader(dataloader, model)
         session = model.prepare_session(
@@ -975,9 +2071,12 @@ class QNNEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         inference_output, targets = self._inference(model, metric, dataloader, post_func, device, execution_providers)
+        OliveEvaluator.save_sample_log(
+            metric.name, metric.sample_log_dir, inference_output, targets, metric.sample_log_num
+        )
         return OliveEvaluator.compute_accuracy(metric, inference_output, targets)
 
     def _evaluate_raw_latency(
@@ -987,7 +2086,7 @@ class QNNEvaluator(_OliveEvaluator):
         dataloader: "DataLoader",
         post_func=None,
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> list[float]:
         dataloader = self._prepare_dataloader(dataloader, model, 1)
         warmup_num, repeat_test_num, sleep_num = get_latency_config_from_metric(metric)
@@ -1023,16 +2122,89 @@ class LMEvaluator(OliveEvaluator):
         self.model_class = kwargs.get("model_class")
         self.batch_size = kwargs.get("batch_size", 1)
         self.max_length = kwargs.get("max_length")
+        # Preserve lm-eval bootstrap control from recipe configs. Some generation metrics disable
+        # bootstrap stderr resampling to avoid extra post-processing work on large test sets.
+        self.bootstrap_iters = kwargs.get("bootstrap_iters", 100000)
         self.ep = kwargs.get("execution_provider")
         self.ep_options = kwargs.get("provider_options")
         self.device = kwargs.get("device")
+        # Extra keyword arguments forwarded verbatim to the lm-eval model backend constructor
+        # (e.g. ``past_present_share_buffer`` for the ``ortgenai`` backend). Backend-specific;
+        # values here override the defaults Olive derives (batch_size, max_length, ep, ...).
+        self.model_args = kwargs.get("model_args") or {}
+        if not isinstance(self.model_args, dict):
+            raise ValueError(f"model_args must be a dict, got {type(self.model_args).__name__}.")
+        # When > 0, log the first N per-task sample predictions (question, prediction, target) to a
+        # JSONL file for debugging, mirroring the accuracy evaluators' ``sample_log`` behavior.
+        self.sample_log_num = kwargs.get("sample_log_num", 0)
+        self.sample_log_dir = kwargs.get("sample_log_dir")
+        # Chat-template / prompting controls forwarded to lm-eval's ``simple_evaluate``. Instruction-
+        # tuned models (e.g. Gemma) score near-random on multiple-choice tasks unless the request is
+        # wrapped in their chat template, so allow recipes to opt in. Defaults preserve lm-eval's
+        # legacy behavior (no chat template, no system prompt) so existing configs are unaffected.
+        # ``apply_chat_template`` may be a bool or, for models with multiple templates, a template name.
+        self.apply_chat_template = kwargs.get("apply_chat_template", False)
+        self.system_instruction = kwargs.get("system_instruction")
+        # Render few-shot examples as separate chat turns instead of one flattened block; only takes
+        # effect when ``apply_chat_template`` is enabled (lm-eval rejects it otherwise).
+        self.fewshot_as_multiturn = kwargs.get("fewshot_as_multiturn", False)
+        # Number of in-context few-shot examples. ``None`` keeps each task's own default (0 for many
+        # tasks); set it to match a model card's reported protocol (e.g. 5-shot MMLU).
+        self.num_fewshot = kwargs.get("num_fewshot")
+
+    @staticmethod
+    def _extract_prediction(filtered_resps):
+        """Best-effort recovery of the model's prediction from an lm-eval sample record.
+
+        For multiple-choice tasks ``filtered_resps`` is a list of ``[loglikelihood, is_greedy]``
+        pairs (one per choice); the prediction is the argmax choice index. For generation tasks it
+        is a list of response strings, which are returned as-is.
+        """
+        if not filtered_resps:
+            return filtered_resps
+        first = filtered_resps[0]
+        if isinstance(first, (list, tuple)) and first and isinstance(first[0], (int, float, bool)):
+            logliks = [r[0] for r in filtered_resps]
+            return int(max(range(len(logliks)), key=logliks.__getitem__))
+        return filtered_resps
+
+    @classmethod
+    def _lmeval_samples_to_output(cls, samples: list, num_samples: int) -> tuple["OliveModelOutput", list]:
+        """Convert lm-eval per-task sample records into an ``OliveModelOutput`` + targets.
+
+        Extracts the question, options and resolved prediction from each record and packs the
+        per-sample metadata (``question``, ``options``, ``prediction_index``, ``acc``) into
+        ``extras`` so the shared :meth:`OliveEvaluator.save_sample_log` writer can persist them.
+        """
+        n = min(num_samples, len(samples))
+        preds, targets, extras = [], [], []
+        for s in samples[:n]:
+            doc = s.get("doc") or {}
+            extra = {}
+            for qk in ("question", "query", "input", "problem"):
+                if qk in doc:
+                    extra["question"] = doc[qk]
+                    break
+            options = doc.get("options") or doc.get("choices")
+            if options is not None:
+                extra["options"] = options
+            pred = cls._extract_prediction(s.get("filtered_resps"))
+            if isinstance(pred, int) and isinstance(options, list) and 0 <= pred < len(options):
+                extra["prediction_index"] = pred
+                pred = f"{chr(ord('A') + pred)}. {options[pred]}"
+            if "acc" in s:
+                extra["acc"] = s["acc"]
+            preds.append(pred)
+            targets.append(s.get("target"))
+            extras.append(extra)
+        return OliveModelOutput(preds=preds, logits=None, extras=extras), targets
 
     def evaluate(
         self,
         model: "OliveModelHandler",
         metrics: list[Metric],
         device: Device = Device.CPU,
-        execution_providers: Union[str, list[str]] = None,
+        execution_providers: Optional[Union[str, list[str]]] = None,
     ) -> MetricResult:
         from lm_eval import simple_evaluate
         from lm_eval.api.registry import get_model
@@ -1067,7 +2239,7 @@ class LMEvaluator(OliveEvaluator):
             }
         elif self.model_class == "ortgenai":
             init_args = {
-                "pretrained": str(Path(model.model_path).parent),
+                "pretrained": _get_genai_model_dir(model),
                 "ep": self.ep or execution_providers,
                 "ep_options": self.ep_options,
                 "device": device,
@@ -1084,7 +2256,7 @@ class LMEvaluator(OliveEvaluator):
         metrics = {}
         if MetricType.SIZE_ON_DISK.value in self.tasks:
             self.tasks.remove(MetricType.SIZE_ON_DISK.value)
-            metrics[MetricType.SIZE_ON_DISK.value] = MetricResult.parse_obj(
+            metrics[MetricType.SIZE_ON_DISK.value] = MetricResult.model_validate(
                 {
                     SizeOnDiskSubType.BYTES.value: {
                         "value": model.size_on_disk,
@@ -1095,43 +2267,214 @@ class LMEvaluator(OliveEvaluator):
             )
 
         if self.tasks:
-            lmmodel = get_model(self.model_class)(**init_args, batch_size=self.batch_size, max_length=self.max_length)
+            model_init_args = {
+                **init_args,
+                "batch_size": self.batch_size,
+                "max_length": self.max_length,
+                # User-provided model_args win over the Olive-derived defaults above.
+                **self.model_args,
+            }
+            lmmodel = get_model(self.model_class)(**model_init_args)
+
+            # Keep lm-eval's batching consistent with the backend's effective batch size,
+            # which model_args may have overridden.
+            effective_batch_size = model_init_args["batch_size"]
 
             results = simple_evaluate(
                 model=lmmodel,
                 tasks=self.tasks,
                 task_manager=TaskManager(),
-                log_samples=False,
-                batch_size=self.batch_size,
+                log_samples=self.sample_log_num > 0,
+                batch_size=effective_batch_size,
                 device=device,
                 limit=self.limit,
+                # Forward the configured value instead of letting lm-eval silently use its default.
+                bootstrap_iters=self.bootstrap_iters,
+                # Wrap requests in the model's chat template / system prompt when requested so
+                # instruction-tuned models are evaluated the way they are served.
+                apply_chat_template=self.apply_chat_template,
+                system_instruction=self.system_instruction,
+                fewshot_as_multiturn=self.fewshot_as_multiturn,
+                num_fewshot=self.num_fewshot,
             )
+
+            if self.sample_log_num > 0:
+                sample_dir = Path(self.sample_log_dir) if self.sample_log_dir else Path.cwd() / "sample_logs"
+                for task_name, task_samples in (results.get("samples") or {}).items():
+                    if not task_samples:
+                        continue
+                    output, targets = self._lmeval_samples_to_output(task_samples, self.sample_log_num)
+                    OliveEvaluator.save_sample_log(task_name, sample_dir, output, targets, self.sample_log_num)
 
             for task_name in sorted(results["results"].keys()):
                 metric_items = sorted(results["results"][task_name].items())
 
                 task_metrics = {}
                 for mf, v in metric_items:
-                    if mf != "alias":
+                    if mf == "alias":
+                        continue
+                    if not isinstance(v, (int, float)):
+                        continue
+                    if "," in mf:
                         m, _ = mf.split(",", 1)
-                        if not m.endswith("_stderr"):
-                            task_metrics[m] = SubMetricResult(value=v, priority=-1, higher_is_better=True)
+                    else:
+                        m = mf
+                    if not m.endswith("_stderr"):
+                        task_metrics[m] = SubMetricResult(value=v, priority=-1, higher_is_better=True)
 
-                metrics[task_name] = MetricResult.parse_obj(task_metrics)
+                metrics[task_name] = MetricResult.model_validate(task_metrics)
 
         return flatten_metric_result(metrics)
 
 
-class OliveEvaluatorConfig(NestedConfig):
-    _nested_field_name = "type_args"
+@Registry.register("MTEBEvaluator")
+class MTEBEvaluator(OliveEvaluator):
+    """Evaluator for embedding models using the MTEB (Massive Text Embedding Benchmark) library.
 
-    name: str = None
-    type: str = None
+    Supports three model classes, mirroring :class:`LMEvaluator`:
+
+    - ``"hf"`` — evaluates a HuggingFace model via sentence-transformers
+    - ``"ort"`` — evaluates a plain ONNX model via ORT inference session
+    - ``"ortgenai"`` — evaluates an ORT-GenAI model (ModelBuilder output)
+
+    Example recipe config::
+
+        "evaluators": {
+            "evaluator": {
+                "type": "MTEBEvaluator",
+                "tasks": ["STS17"],
+                "batch_size": 32
+            }
+        },
+        "evaluator": "evaluator"
+    """
+
+    def __init__(self, tasks: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.tasks = tasks
+        self.batch_size = kwargs.get("batch_size", 32)
+        self.max_length = kwargs.get("max_length")
+        self.model_class = kwargs.get("model_class")
+        self.ep = kwargs.get("execution_provider")
+        self.ep_options = kwargs.get("provider_options")
+        self.eval_splits = kwargs.get("eval_splits")
+        self.eval_subsets = kwargs.get("eval_subsets")
+        self.output_folder = kwargs.get("output_folder")
+
+    def evaluate(
+        self,
+        model: "OliveModelHandler",
+        metrics: list[Metric],
+        device: Device = Device.CPU,
+        execution_providers: Optional[Union[str, list[str]]] = None,
+    ) -> MetricResult:
+        import mteb
+
+        from olive.evaluator.mteb_ort import MTEBORTEvaluator, MTEBORTGenAIEvaluator
+
+        # Auto-detect model class from the model handler
+        model_class = self.model_class
+        if not model_class:
+            if isinstance(model, HfModelHandler):
+                model_class = "hf"
+            elif isinstance(model, ONNXModelHandler):
+                # ModelBuilder outputs ONNXModelHandler but with genai_config.json
+                genai_config_path = _find_genai_config(model)
+                model_class = "ortgenai" if genai_config_path is not None else "ort"
+            else:
+                raise ValueError(
+                    "Unable to auto-detect model_class for MTEBEvaluator from model handler "
+                    f"{type(model).__name__}. Please set model_class explicitly to one of "
+                    "'hf', 'ort', or 'ortgenai'."
+                )
+
+        logger.info("Running MTEB evaluation with model_class=%s, tasks=%s", model_class, self.tasks)
+
+        # Build the MTEB-compatible model wrapper
+        if model_class == "hf":
+            from sentence_transformers import SentenceTransformer
+
+            # Map Olive Device to PyTorch device string (Olive uses "gpu", PyTorch expects "cuda")
+            device_str = device.value if isinstance(device, Device) else str(device)
+            normalized = device_str.lower()
+            if normalized == "gpu":
+                sentence_transformer_device = "cuda"
+            elif normalized.startswith("gpu:"):
+                sentence_transformer_device = f"cuda{device_str[3:]}"
+            else:
+                sentence_transformer_device = device_str
+            mteb_model = SentenceTransformer(model.model_name_or_path, device=sentence_transformer_device)
+        elif model_class == "ort":
+            mteb_model = MTEBORTEvaluator(
+                model_path=model.model_path,
+                batch_size=self.batch_size,
+                max_length=self.max_length,
+                ep=self.ep
+                or (execution_providers[0] if isinstance(execution_providers, list) else execution_providers),
+                ep_options=self.ep_options,
+            )
+        elif model_class == "ortgenai":
+            mteb_model = MTEBORTGenAIEvaluator(
+                pretrained=_get_genai_model_dir(model),
+                batch_size=self.batch_size,
+                max_length=self.max_length,
+                ep=self.ep
+                or (execution_providers[0] if isinstance(execution_providers, list) else execution_providers)
+                or "follow_config",
+                ep_options=self.ep_options,
+            )
+        else:
+            raise ValueError(f"Unknown model class for MTEBEvaluator: {model_class}")
+
+        # Run MTEB evaluation
+        mteb_tasks = mteb.get_tasks(tasks=self.tasks)
+        evaluation = mteb.MTEB(tasks=mteb_tasks)
+
+        run_kwargs = {}
+        if self.eval_splits:
+            run_kwargs["eval_splits"] = self.eval_splits
+        if self.eval_subsets:
+            run_kwargs["eval_subsets"] = self.eval_subsets
+
+        task_results = evaluation.run(
+            mteb_model,
+            output_folder=self.output_folder,
+            overwrite_results=True,
+            verbosity=0,
+            **run_kwargs,
+        )
+
+        # Convert MTEB results into Olive MetricResult
+        metrics_dict = {}
+        for task_result in task_results:
+            task_name = task_result.task_name
+            task_metrics = {
+                "main_score": SubMetricResult(value=task_result.main_score, priority=-1, higher_is_better=True),
+            }
+            for split_name, split_scores in task_result.scores.items():
+                for lang_score in split_scores:
+                    subset = lang_score.get("hf_subset", "")
+                    score_key = f"{split_name}_{subset}" if subset else split_name
+                    task_metrics[score_key] = SubMetricResult(
+                        value=lang_score.get("main_score", 0.0),
+                        priority=-1,
+                        higher_is_better=True,
+                    )
+            metrics_dict[task_name] = MetricResult.model_validate(task_metrics)
+
+        return flatten_metric_result(metrics_dict)
+
+
+class OliveEvaluatorConfig(NestedConfig):
+    _nested_field_name: ClassVar[str] = "type_args"
+
+    name: Optional[str] = None
+    type: Optional[str] = None
     type_args: dict = Field(default_factory=dict)
 
     # user script to define and register the evaluator
-    user_script: Union[Path, str] = None
-    script_dir: Union[Path, str] = None
+    user_script: Optional[Union[Path, str]] = None
+    script_dir: Optional[Union[Path, str]] = None
 
     metrics: list[Metric] = []  # noqa: RUF012
 
@@ -1149,8 +2492,13 @@ class OliveEvaluatorConfig(NestedConfig):
                     return sub_metric.goal is not None and sub_metric.goal.has_regression_goal()
         return False
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def validate_type(cls, values):
+        # In pydantic v2, values can be None when no arguments are provided
+        if values is None:
+            values = {}
+
         if values.get("user_script"):
             import_user_module(values["user_script"], values.get("script_dir"))
 
@@ -1160,7 +2508,8 @@ class OliveEvaluatorConfig(NestedConfig):
 
         return values
 
-    @validator("metrics")
+    @field_validator("metrics")
+    @classmethod
     def validate_metrics(cls, v):
         metric_len = len(v)
 

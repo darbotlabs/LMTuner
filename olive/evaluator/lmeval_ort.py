@@ -8,14 +8,20 @@ import json
 import logging
 from abc import abstractmethod
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from lm_eval.models.utils import Collator, pad_and_concat
+from lm_eval.models.utils import Collator
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
+
+try:
+    from lm_eval.models.utils_hf import pad_and_concat  # pylint: disable=ungrouped-imports
+except ImportError:
+    from lm_eval.models.utils import pad_and_concat
 
 from olive.common.onnx_io import get_io_config, get_io_dtypes, get_kv_info
 from olive.common.utils import cleanup_memory
@@ -33,12 +39,24 @@ LogLikelihoodInputs = tuple[tuple[str, str], list[int], list[int]]
 class LMEvalOnnxBase(TemplateLM):
     """Base class for ONNX model evaluation."""
 
+    @property
+    def device(self):
+        # lm-eval's LM base class exposes ``device`` as a read-only property
+        # (backed by ``_device``). The ONNX evaluators assign ``self.device``
+        # in ``__init__`` (e.g. for IOBinding placement), so provide a setter
+        # to keep that assignment working across lm-eval versions.
+        return getattr(self, "_device", None)
+
+    @device.setter
+    def device(self, value):
+        self._device = value
+
     @abstractmethod
     def prepare(self, requests: list[LogLikelihoodInputs]):
         pass
 
     @abstractmethod
-    def model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def model_call(self, input_ids: torch.Tensor, cont_len: int = 0) -> torch.Tensor:
         pass
 
     @abstractmethod
@@ -123,8 +141,9 @@ class LMEvalOnnxBase(TemplateLM):
                 inplens.append(inplen)
 
             batched_inps = pad_and_concat(padding_len_inp, inps, padding_side="right")  # [batch, padding_len_inp]
+            max_cont_len = max(len(c) for c in cont_toks_list)
 
-            multi_logits = self.model_call(batched_inps)  # [batch, padding_length (inp or cont), vocab]
+            multi_logits = self.model_call(batched_inps, max_cont_len)  # [batch, padding_length (inp or cont), vocab]
 
             # ruff: noqa: PLW2901
             for (request_str, ctx_tokens, _), logits, inplen, cont_toks in zip(
@@ -253,7 +272,7 @@ class LMEvalORTEvaluator(LMEvalOnnxBase):
         max_length = min(max_length, self.max_length)
         self.prefill.initialize_buffers(self.batch_size, max_length)
 
-    def model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def model_call(self, input_ids: torch.Tensor, cont_len: int = 0) -> torch.Tensor:
         return self.prefill.run(input_ids)
 
     def complete(self):
@@ -286,6 +305,21 @@ class Prefill:
         self.kv_info = get_kv_info(self.io_config)
         if self.kv_info is None:
             raise ValueError("Invalid io_config: kv_info not found")
+
+        # detect position_ids rank, hybrid state inputs and outputs in a single pass
+        self.position_ids_rank = 2
+        self.hybrid_states = {}
+        self.hybrid_state_outputs = {}
+        for prefix in ("input", "output"):
+            names = self.io_config[f"{prefix}_names"]
+            shapes = self.io_config[f"{prefix}_shapes"]
+            types = self.io_config[f"{prefix}_types"]
+            target = self.hybrid_states if prefix == "input" else self.hybrid_state_outputs
+            for idx, name in enumerate(names):
+                if name == "position_ids":
+                    self.position_ids_rank = len(shapes[idx])
+                elif "conv_state" in name or "recurrent_state" in name:
+                    target[name] = {"shape": shapes[idx], "dtype": types[idx]}
 
         self._session = None
         self._batch_size = None
@@ -325,17 +359,29 @@ class Prefill:
             inputs_to_bind[name] = (self._buffers["inputs"][name], self.io_dtypes[name], shape)
         if "position_ids" in self._buffers["inputs"]:
             # need to reallocate since the position_ids tensor may be sliced
-            inputs_to_bind["position_ids"] = (
-                self._buffers["inputs"]["position_ids"][:batch_size, :seqlen].contiguous(),
-                self.io_dtypes["position_ids"],
-                (batch_size, seqlen),
-            )
+            if self.position_ids_rank == 3:
+                inputs_to_bind["position_ids"] = (
+                    self._buffers["inputs"]["position_ids"][:, :batch_size, :seqlen].contiguous(),
+                    self.io_dtypes["position_ids"],
+                    (self._buffers["inputs"]["position_ids"].shape[0], batch_size, seqlen),
+                )
+            else:
+                inputs_to_bind["position_ids"] = (
+                    self._buffers["inputs"]["position_ids"][:batch_size, :seqlen].contiguous(),
+                    self.io_dtypes["position_ids"],
+                    (batch_size, seqlen),
+                )
         for name in self._buffers["kv_inputs"]:
             inputs_to_bind[name] = (
                 self._buffers["kv_inputs"][name],
                 self.kv_info["dtype"],
                 (batch_size, self.kv_info["num_kv_heads"], 0, self.kv_info["head_size"]),
             )
+        # hybrid state inputs (conv_state, recurrent_state)
+        for name, buf in self._buffers["hybrid_inputs"].items():
+            shape = list(buf.shape)
+            shape[0] = batch_size
+            inputs_to_bind[name] = (buf, self.hybrid_states[name]["dtype"], tuple(shape))
         for name, (buffer, dtype, shape) in inputs_to_bind.items():
             io_binding.bind_input(
                 name,
@@ -357,6 +403,11 @@ class Prefill:
                 self.kv_info["dtype"],
                 (batch_size, self.kv_info["num_kv_heads"], seqlen, self.kv_info["head_size"]),
             )
+        # hybrid state outputs (conv_state, recurrent_state)
+        for name, buf in self._buffers["hybrid_outputs"].items():
+            shape = list(buf.shape)
+            shape[0] = batch_size
+            outputs_to_bind[name] = (buf, self.hybrid_state_outputs[name]["dtype"], tuple(shape))
         for name, (buffer, dtype, shape) in outputs_to_bind.items():
             io_binding.bind_output(
                 name,
@@ -412,11 +463,16 @@ class Prefill:
             )
         }
         if self.io_dtypes.get("position_ids") is not None:
-            inputs["position_ids"] = (
+            pos_ids = (
                 torch.arange(max_length, dtype=getattr(torch, self.io_dtypes["position_ids"]), device=self.device)
                 .unsqueeze(0)
                 .expand(batch_size, -1)
             )
+            if self.position_ids_rank == 3:
+                # mRoPE: expand to [mrope_sections, batch_size, seq_len]
+                mrope_sections = self.io_config["input_shapes"][self.io_config["input_names"].index("position_ids")][0]
+                pos_ids = pos_ids.unsqueeze(0).expand(mrope_sections, -1, -1)
+            inputs["position_ids"] = pos_ids
         if self.io_dtypes.get("past_seq_len") is not None:
             inputs["past_seq_len"] = (
                 torch.tensor(max_length - 1, dtype=getattr(torch, self.io_dtypes["past_seq_len"]), device=self.device)
@@ -451,12 +507,54 @@ class Prefill:
         }
 
         self._buffers = {"inputs": inputs, "outputs": outputs, "kv_inputs": kv_inputs, "kv_outputs": kv_outputs}
+
+        # hybrid state buffers (conv_state, recurrent_state) - zero-initialized
+        hybrid_inputs = {}
+        for name, info in self.hybrid_states.items():
+            # Replace symbolic 'batch_size' with actual batch_size
+            shape = [batch_size if s == "batch_size" else s for s in info["shape"]]
+            hybrid_inputs[name] = torch.zeros(shape, dtype=getattr(torch, info["dtype"]), device=self.device)
+        hybrid_outputs = {}
+        for name, info in self.hybrid_state_outputs.items():
+            shape = [batch_size if s == "batch_size" else s for s in info["shape"]]
+            hybrid_outputs[name] = torch.zeros(shape, dtype=getattr(torch, info["dtype"]), device=self.device)
+        self._buffers["hybrid_inputs"] = hybrid_inputs
+        self._buffers["hybrid_outputs"] = hybrid_outputs
+
         self._batch_size = batch_size
 
 
 @register_model("ortgenai")
 class LMEvalORTGenAIEvaluator(LMEvalOnnxBase):
     """Evaluate a model using ONNX Runtime GenAI."""
+
+    _ORT_GENAI_PROVIDER_NAMES: ClassVar[dict[str, str]] = {
+        "cpu": "CPU",
+        "cuda": "cuda",
+        "dml": "DML",
+        "openvino": "OpenVINO",
+        "qnn": "QNN",
+        "vitisai": "VitisAI",
+        "webgpu": "WebGPU",
+        "nvtensorrtrtx": "NvTensorRtRtx",
+    }
+
+    @classmethod
+    def _normalize_provider_name(cls, ep: str) -> tuple[str, str]:
+        """Return the normalized Olive EP key and the provider name expected by ORT GenAI."""
+        normalized_ep = str(ep).lower().replace("executionprovider", "")
+        return normalized_ep, cls._ORT_GENAI_PROVIDER_NAMES.get(normalized_ep, normalized_ep)
+
+    @staticmethod
+    def _resolve_past_present_share_buffer(override: bool | None, genai_config: dict) -> bool:
+        """Resolve the ``past_present_share_buffer`` search option.
+
+        An explicit ``override`` takes precedence; otherwise fall back to the exported
+        ``genai_config.json`` value (defaulting to ``False`` when absent).
+        """
+        if override is not None:
+            return override
+        return genai_config.get("search", {}).get("past_present_share_buffer", False)
 
     def __init__(
         self,
@@ -466,6 +564,7 @@ class LMEvalORTGenAIEvaluator(LMEvalOnnxBase):
         ep: str = "follow_config",
         ep_options: dict | None = None,
         device: str = "cpu",
+        past_present_share_buffer: bool | None = None,
         **kwargs,
     ):
         """Initialize the evaluator.
@@ -476,6 +575,9 @@ class LMEvalORTGenAIEvaluator(LMEvalOnnxBase):
         :param ep: The execution provider to use. "follow_config" will use the provider specified in the genai_config file
         :param ep_options: The options to use for the execution provider. Only applicable if ep is not "follow_config"
         :param device: The device to run log likelihood calculations on
+        :param past_present_share_buffer: Override the exported ``search.past_present_share_buffer`` setting. When
+            ``None`` (default) the value from ``genai_config.json`` is used. Some models (e.g. Gemma 4) export with
+            shared buffers enabled but require it disabled for correct KV-cache handling during evaluation.
         """
         if og is None:
             raise ImportError("onnxruntime-genai is not installed.")
@@ -484,14 +586,18 @@ class LMEvalORTGenAIEvaluator(LMEvalOnnxBase):
 
         self.config = og.Config(pretrained)
         if ep != "follow_config":
-            ep = ep.lower().replace("executionprovider", "")
+            # Accept Olive-style EP names from recipes while calling ORT GenAI with
+            # the provider names used in genai_config.json/session options.
+            ep, provider_name = self._normalize_provider_name(ep)
             self.config.clear_providers()
             if ep != "cpu":
-                self.config.append_provider(ep)
+                self.config.append_provider(provider_name)
             for key, value in (ep_options or {}).items():
-                self.config.set_provider_option(ep, key, value)
+                self.config.set_provider_option(provider_name, key, value)
         self.model = og.Model(self.config)
         self.tokenizer = og.Tokenizer(self.model)
+        self._pretrained = str(pretrained)
+        self._hf_tokenizer: AutoTokenizer | None = None
 
         # consider adding auto batch sizes
         self.batch_size = int(batch_size)
@@ -503,30 +609,166 @@ class LMEvalORTGenAIEvaluator(LMEvalOnnxBase):
                 self.max_length = max_length
             else:
                 self.max_length = genai_config["search"]["max_length"]
-            self._eot_token_id = genai_config["model"]["eos_token_id"]
+            eot = genai_config["model"]["eos_token_id"]
+            # eos_token_id can be a list (e.g. [1, 106] for Gemma4) or a scalar.
+            # Store all EOS IDs for generate_until stop detection,
+            # and first/scalar for loglikelihood (TemplateLM.eot_token_id expects int).
+            self._eos_token_ids = list(eot) if isinstance(eot, list) else [eot]
+            self._eot_token_id = self._eos_token_ids[0]
+            # Mirror the exported GenAI cache-sharing setting when creating GeneratorParams.
+            # Artifacts with shared past/present buffers require the same search option at runtime.
+            # An explicit override (e.g. from a recipe config) takes precedence over the exported value.
+            self._past_present_share_buffer = self._resolve_past_present_share_buffer(
+                past_present_share_buffer, genai_config
+            )
         self.params = og.GeneratorParams(self.model)
-        self.params.set_search_options(max_length=self.max_length, past_present_share_buffer=False)
+        self.params.set_search_options(
+            max_length=self.max_length,
+            past_present_share_buffer=self._past_present_share_buffer,
+        )
 
-        self.device = device
+        self._device = device
+        self._returns_full_logits = self._detect_full_logits()
+
+    @property
+    def tokenizer_name(self) -> str:
+        return self._pretrained.replace("\\", "__").replace("/", "__")
+
+    def apply_chat_template(self, chat_history: list[dict], add_generation_prompt: bool = True) -> str:
+        if self._hf_tokenizer is None:
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(self._pretrained)
+        return self._hf_tokenizer.apply_chat_template(
+            chat_history,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
+        )
+
+    def _detect_full_logits(self) -> bool:
+        """Check if the model returns logits for all input positions or only the last."""
+        try:
+            dummy_len = 3
+            params = og.GeneratorParams(self.model)
+            params.set_search_options(
+                max_length=self.max_length,
+                past_present_share_buffer=self._past_present_share_buffer,
+                batch_size=1,
+            )
+            generator = og.Generator(self.model, params)
+            dummy_ids = [[self._eot_token_id] * dummy_len]
+            generator.append_tokens(dummy_ids)
+            logits = generator.get_output("logits")
+            return logits.shape[1] == dummy_len
+        except Exception:
+            return False
 
     @property
     def eot_token_id(self):
         return self._eot_token_id
 
-    def tok_encode(self, string: str, **kwargs) -> list[int]:
+    def tok_encode(self, string: str, add_special_tokens: bool | None = None, **kwargs) -> list[int]:
         """Tokenize a string using the model's tokenizer and return a list of token IDs."""
         return self.tokenizer.encode(string).tolist()
 
     def prepare(self, requests: list[LogLikelihoodInputs]):
         pass
 
-    def model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
-        batch_size, _ = input_ids.shape
+    def model_call(self, input_ids: torch.Tensor, cont_len: int = 0) -> torch.Tensor:
+        batch_size, seq_len = input_ids.shape
         self.params.set_search_options(batch_size=batch_size)
         generator = og.Generator(self.model, self.params)
-        generator.append_tokens(input_ids.tolist())
-        # [1, seq, vocab]
-        return torch.from_numpy(generator.get_output("logits")).to(self.device)
+
+        if batch_size > 1 and cont_len > 1:
+            raise ValueError(
+                "batch_size > 1 is not supported when using incremental get_logits() retrieval"
+                " and continuation length > 1. Right-padding misaligns continuation positions across"
+                " batch elements. Use batch_size=1 instead."
+            )
+
+        # Use incremental token appending with get_logits() to avoid copying
+        # the full logits tensor from GPU to CPU. get_output("logits") copies
+        # seq_len * vocab_size * 2 bytes (e.g. 472MB for 900 tokens with
+        # 262K vocab), while get_logits() copies only vocab_size * 4 bytes
+        # (~1MB) per position.
+        n_logits = max(cont_len, 1)
+        prefix_len = seq_len - n_logits
+        generator.append_tokens(input_ids[:, : prefix_len + 1].tolist())
+        all_logits = [torch.from_numpy(generator.get_logits()).to(self._device)]
+        for i in range(prefix_len + 1, seq_len):
+            generator.append_tokens(input_ids[:, i : i + 1].tolist())
+            all_logits.append(torch.from_numpy(generator.get_logits()).to(self._device))
+
+        # No need to pad to [batch, seq_len, vocab]. The slicing in _loglikelihood_tokens computes
+        # ctx_len = inplen + (logits.shape[0] - padding_len_inp), which adjusts for the shorter
+        # seq dimension so the continuation slice still lands on the correct positions.
+        return torch.cat(all_logits, dim=1)  # [batch, n_logits, vocab]
 
     def complete(self):
         pass
+
+    def generate_until(self, requests, disable_tqdm: bool = False) -> list[str]:
+        """Generate text until a stop sequence is reached.
+
+        Used by benchmarks like MMLU Pro (CoT variant) that score by generating
+        chain-of-thought text and extracting the answer with a regex filter.
+        """
+        results = []
+        for request in tqdm(requests, disable=disable_tqdm, desc="Running generate_until requests"):
+            context = request.args[0]
+            gen_kwargs = request.args[1]
+
+            until = gen_kwargs.get("until", [])
+            max_gen_toks = gen_kwargs.get("max_gen_toks", 256)
+            if isinstance(until, str):
+                until = [until]
+
+            input_ids = self.tok_encode(context)
+            max_new_tokens = min(max_gen_toks, self.max_length - len(input_ids))
+            if max_new_tokens <= 0:
+                results.append("")
+                continue
+
+            params = og.GeneratorParams(self.model)
+            params.set_search_options(
+                max_length=len(input_ids) + max_new_tokens,
+                past_present_share_buffer=self._past_present_share_buffer,
+                batch_size=1,
+            )
+            if gen_kwargs.get("temperature", 0.0) == 0.0:
+                params.set_search_options(do_sample=False)
+            else:
+                params.set_search_options(
+                    do_sample=True,
+                    temperature=gen_kwargs["temperature"],
+                )
+
+            generator = og.Generator(self.model, params)
+            generator.append_tokens([input_ids])
+
+            eos_ids = self._eos_token_ids
+
+            generated_ids = []
+            # Decode periodically to check for stop sequences
+            decode_interval = 16
+            while not generator.is_done():
+                generator.generate_next_token()
+                token_id = generator.get_next_tokens()[0]
+                generated_ids.append(token_id)
+                if token_id in eos_ids:
+                    break
+                # Check stop sequences periodically by decoding
+                if until and len(generated_ids) % decode_interval == 0:
+                    partial_text = self.tokenizer.decode(generated_ids)
+                    if any(stop_seq in partial_text for stop_seq in until):
+                        break
+
+            generated_text = self.tokenizer.decode(generated_ids)
+
+            # Truncate at the first stop sequence
+            for stop_seq in until:
+                idx = generated_text.find(stop_seq)
+                if idx != -1:
+                    generated_text = generated_text[:idx]
+
+            results.append(generated_text)
+        return results

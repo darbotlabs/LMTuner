@@ -14,8 +14,6 @@ _sc.setFormatter(_formatter)
 _logger.addHandler(_sc)
 _logger.propagate = False
 
-__version__ = "0.11.0.dev0"
-
 # pylint: disable=C0413
 
 # Import Python API functions
@@ -28,15 +26,18 @@ from olive.cli.api import (  # noqa: E402
     finetune,
     generate_adapter,
     generate_cost_model,
+    optimize,
     quantize,
     run,
     tune_session_params,
 )
 from olive.engine.output import ModelOutput, WorkflowOutput  # noqa: E402
+from olive.version import __version__  # noqa: E402
 
 __all__ = [
     "ModelOutput",
     "WorkflowOutput",
+    "__version__",
     # Python API functions
     "benchmark",
     "capture_onnx_graph",
@@ -46,6 +47,7 @@ __all__ = [
     "finetune",
     "generate_adapter",
     "generate_cost_model",
+    "optimize",
     "quantize",
     "run",
     "tune_session_params",

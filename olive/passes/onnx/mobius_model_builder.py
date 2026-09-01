@@ -1,0 +1,338 @@
+# -------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+# --------------------------------------------------------------------------
+"""Build ONNX models from HuggingFace model IDs using the mobius package."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
+
+from olive.common.utils import StrEnumBase
+from olive.constants import Precision
+from olive.hardware.constants import EXECUTION_PROVIDER_TO_MOBIUS_EP, ExecutionProvider
+from olive.model import HfModelHandler, ONNXModelHandler
+from olive.model.handler.composite import CompositeModelHandler
+from olive.passes import Pass
+from olive.passes.olive_pass import PassConfigParam
+
+if TYPE_CHECKING:
+    from olive.hardware.accelerator import AcceleratorSpec
+    from olive.passes.pass_config import BasePassConfig
+
+logger = logging.getLogger(__name__)
+
+# Maps Olive Precision values to mobius dtype strings.
+# "f32" = 32-bit float (torch.float32), standard full precision.
+# "f16" = 16-bit float (torch.float16), half precision — good for GPU inference.
+# "bf16" = bfloat16 (torch.bfloat16), brain float — preferred over f16 on newer hardware.
+# For INT4/INT8 quantization, use a downstream Olive quantization pass (e.g. OnnxMatMulNBits)
+# after this pass rather than setting precision here.
+_PRECISION_TO_DTYPE: dict[str, str] = {
+    Precision.FP32: "f32",
+    Precision.FP16: "f16",
+    Precision.BF16: "bf16",
+}
+
+
+class MobiusBuilder(Pass):
+    """Olive pass that uses mobius to build ONNX models from HuggingFace model IDs.
+
+    Supports all model architectures registered in mobius (LLMs, VLMs, speech
+    models, diffusion models).  For multi-component models (e.g. vision-language
+    models that produce ``model``, ``vision``, and ``embedding`` sub-graphs) the
+    pass returns a :class:`~olive.model.handler.composite.CompositeModelHandler`
+    whose components are individual :class:`~olive.model.ONNXModelHandler` objects.
+    Single-component models return a plain :class:`~olive.model.ONNXModelHandler`.
+
+    Use ``components_to_export`` to export only a subset of components.  This is
+    useful when some components (e.g. a text decoder) are already exported and
+    you only need the remaining ones (e.g. vision encoder and embedding)::
+
+        {
+            "type": "MobiusBuilder",
+            "model_path": "mistralai/Ministral-3B-Instruct-2512",
+            "components_to_export": ["vision_encoder", "embedding"]
+        }
+
+    Raises :class:`ValueError` if ``components_to_export`` is an empty list or
+    contains names not present in the built package.
+
+    ORT GenAI config generation (``genai_config.json``, tokenizer files, processor
+    configs) is skipped when ``components_to_export`` is set, since mobius has no
+    API to scope that config to a subset of a package — the caller is responsible
+    for producing a ``genai_config.json`` that covers the full pipeline (e.g. by
+    combining this pass's output with another tool's output, as in a recipe that
+    exports the decoder separately).
+
+    Requires ``mobius-onnx`` to be installed::
+
+        pip install mobius-onnx
+
+    See https://github.com/onnxruntime/mobius
+    """
+
+    class MobiusEP(StrEnumBase):
+        """Execution providers supported by mobius."""
+
+        DEFAULT = "default"
+        CPU = "cpu"
+        CUDA = "cuda"
+        WEBGPU = "webgpu"
+        TRT_RTX = "trt-rtx"
+        ONNX_STANDARD = "onnx-standard"
+
+    # Maps Olive ExecutionProvider enum values to mobius EP names.
+    EP_MAP: ClassVar[dict[ExecutionProvider, str]] = {
+        ExecutionProvider.CPUExecutionProvider: "cpu",
+        ExecutionProvider.CUDAExecutionProvider: "cuda",
+        ExecutionProvider.DmlExecutionProvider: "dml",
+        ExecutionProvider.WebGpuExecutionProvider: "webgpu",
+    }
+
+    @classmethod
+    def is_accelerator_agnostic(cls, accelerator_spec: AcceleratorSpec) -> bool:
+        # EP selection determines which fused ops are emitted, so this pass is
+        # EP-specific.
+        return False
+
+    @classmethod
+    def _default_config(cls, accelerator_spec: AcceleratorSpec) -> dict[str, PassConfigParam]:
+        return {
+            "precision": PassConfigParam(
+                type_=Precision,
+                required=False,
+                default_value=Precision.FP32,
+                description=(
+                    "Model weight / compute precision. One of: fp32, fp16, bf16. "
+                    "Defaults to fp32. For INT4 quantization, run an Olive "
+                    "quantization pass (e.g. OnnxMatMulNBits) after this pass."
+                ),
+            ),
+            "components_to_export": PassConfigParam(
+                type_=list[str],
+                required=False,
+                default_value=None,
+                description=(
+                    "Optional list of component names to export from a multi-component model "
+                    "(e.g. ['vision', 'embedding'] to skip the decoder). "
+                    "When set, only the named components are written by ``pkg.save()`` and "
+                    "returned by this pass; all others are skipped entirely. "
+                    "When not set (None), all components are exported (default, backward compatible). "
+                    "Raises ValueError if the list is empty or if any specified name is not found in "
+                    "the model's components."
+                ),
+            ),
+        }
+
+    def _run_for_config(
+        self,
+        model: HfModelHandler,
+        config: type[BasePassConfig],
+        output_model_path: str,
+    ) -> ONNXModelHandler | CompositeModelHandler:
+        try:
+            from mobius import build
+        except ImportError as exc:
+            raise ImportError(
+                "mobius-onnx is required to run MobiusBuilder. Install with: pip install mobius-onnx"
+            ) from exc
+
+        if not isinstance(model, HfModelHandler):
+            raise ValueError(f"MobiusBuilder requires an HfModelHandler input, got {type(model).__name__}.")
+
+        # Map Olive EP to mobius EP. If unsupported/unknown, fall back to mobius default EP.
+        requested_ep = self.accelerator_spec.execution_provider
+        ep_str: str = EXECUTION_PROVIDER_TO_MOBIUS_EP.get(requested_ep, self.MobiusEP.DEFAULT)
+        if ep_str == self.MobiusEP.DEFAULT:
+            logger.warning(
+                "MobiusBuilder: execution provider '%s' on accelerator '%s' is not explicitly supported; "
+                "falling back to mobius default EP.",
+                requested_ep,
+                self.accelerator_spec.accelerator_type,
+            )
+
+        dtype_str: str = _PRECISION_TO_DTYPE.get(config.precision, "f32")
+        model_id: str = model.model_name_or_path
+
+        # Read trust_remote_code from the model's HuggingFace load kwargs.
+        trust_remote_code: bool = model.get_load_kwargs().get("trust_remote_code", False)
+
+        logger.info(
+            "MobiusBuilder: building '%s' (ep=%s, dtype=%s)",
+            model_id,
+            ep_str,
+            dtype_str,
+        )
+
+        if trust_remote_code:
+            logger.warning("MobiusBuilder: trust_remote_code=True — only use with trusted model sources.")
+
+        # Validate components_to_export early (before the expensive build step).
+        if config.components_to_export is not None and len(config.components_to_export) == 0:
+            raise ValueError(
+                "MobiusBuilder: components_to_export cannot be empty. "
+                "Pass None to export all components, or specify at least one component name."
+            )
+
+        output_dir = Path(output_model_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        pkg = build(
+            model_id,
+            dtype=dtype_str,
+            execution_provider=ep_str,
+            load_weights=True,
+            trust_remote_code=trust_remote_code,
+        )
+
+        # Determine which package components to export.
+        all_keys = list(pkg.keys())
+        if config.components_to_export is not None:
+            requested = set(config.components_to_export)
+            unknown = requested - set(all_keys)
+            if unknown:
+                raise ValueError(
+                    f"MobiusBuilder: components_to_export contains unknown component(s): {sorted(unknown)}. "
+                    f"Available components from this model: {sorted(all_keys)}"
+                )
+            package_keys = [k for k in all_keys if k in requested]
+            logger.info(
+                "MobiusBuilder: exporting subset of components %s (skipping %s)",
+                package_keys,
+                [k for k in all_keys if k not in requested],
+            )
+
+            def components_filter(name: str) -> bool:
+                return name in requested
+        else:
+            package_keys = all_keys
+            components_filter = None
+
+        # ModelPackage.save() handles both single and multi-component layouts:
+        #   single component  → <output_dir>/model.onnx
+        #   multi-component   → <output_dir>/<name>/model.onnx  for each key
+        pkg.save(str(output_dir), components=components_filter)
+
+        # ORT GenAI config generation assumes every component in `pkg` was actually saved to
+        # disk (e.g. it unconditionally writes a "decoder/model.onnx" filename reference for
+        # multimodal packages). For a partial export (components_to_export set), that produces
+        # a genai_config.json/tokenizer set that references components we deliberately omitted
+        # — invalid artifacts, since mobius has no API to generate GenAI config for a subset of
+        # a package. Skip config generation entirely in that case and let the caller (e.g. a
+        # recipe combining this partial export with another tool's output) assemble the final
+        # genai_config.json itself.
+        if components_filter is not None:
+            logger.info(
+                "MobiusBuilder: components_to_export is set; skipping ORT GenAI config generation "
+                "since it cannot be scoped to a subset of components. The caller is responsible for "
+                "producing a genai_config.json that covers the full pipeline."
+            )
+            genai_artifacts = {}
+        else:
+            # Generate ORT GenAI config artifacts (genai_config.json, tokenizer
+            # files, processor configs) alongside the ONNX models.
+            genai_artifacts = self._write_genai_config(pkg, str(output_dir), model_id, ep_str)
+
+        logger.info("MobiusBuilder: saved components %s to '%s'", package_keys, output_dir)
+
+        # Use the single-component (root layout) path only when the model is
+        # architecturally single-component.  A multi-component model filtered
+        # down to one component still uses component sub-directories on disk.
+        if len(all_keys) == 1:
+            # Single-component model (most LLMs): return a plain ONNXModelHandler.
+            onnx_path = output_dir / "model.onnx"
+            if not onnx_path.exists():
+                raise RuntimeError(
+                    f"MobiusBuilder: expected output file not found: {onnx_path}. "
+                    "mobius.build() may have failed silently or saved to an unexpected path."
+                )
+            additional_files = sorted(
+                {str(fp) for fp in output_dir.iterdir()} - {str(onnx_path), str(onnx_path) + ".data"}
+            )
+            # Include ORT GenAI artifacts (genai_config.json, tokenizer files, etc.)
+            additional_files = sorted(set(additional_files) | set(genai_artifacts.values()))
+            return ONNXModelHandler(
+                model_path=str(output_dir),
+                onnx_file_name="model.onnx",
+                model_attributes={
+                    "mobius_package_keys": package_keys,
+                    "additional_files": additional_files,
+                    **(model.model_attributes or {}),
+                },
+            )
+
+        # Multi-component model (VLMs, encoder-decoders, diffusion pipelines):
+        # mobius saves each component to <output_dir>/<key>/model.onnx with shared
+        # sidecar files (genai_config.json, tokenizer.json, image_processor.json,
+        # audio_feature_extraction.json) at output_dir root.
+        components = []
+        for key in package_keys:
+            component_dir = output_dir / key
+            onnx_path = component_dir / "model.onnx"
+            if not onnx_path.exists():
+                raise RuntimeError(
+                    f"MobiusBuilder: expected output file not found: {onnx_path}. "
+                    f"mobius.build() may have failed silently for component '{key}'."
+                )
+            # Per-component additional files: only files that live inside the
+            # component's own directory. Shared sidecars (genai_config, tokenizer,
+            # image_processor) are attached to the composite handler below so
+            # they land in the output root, not duplicated in every component.
+            component_additional_files = sorted(
+                {str(fp) for fp in component_dir.iterdir()} - {str(onnx_path), str(onnx_path) + ".data"}
+            )
+            components.append(
+                ONNXModelHandler(
+                    model_path=str(component_dir),
+                    onnx_file_name="model.onnx",
+                    model_attributes={
+                        "mobius_component": key,
+                        "additional_files": component_additional_files,
+                        **(model.model_attributes or {}),
+                    },
+                )
+            )
+
+        return CompositeModelHandler(
+            model_components=components,
+            model_component_names=package_keys,
+            model_path=str(output_dir),
+            model_attributes={
+                "mobius_package_keys": package_keys,
+                # Preserve the <component>/model.onnx subdirectory layout so
+                # ORT GenAI can resolve each component by its "filename" key.
+                # Without this, Olive's cache flattens components to top-level
+                # <name>.onnx files and breaks GenAI loading.
+                "no_flatten": True,
+                # Shared package-level sidecars carried via the composite handler
+                # so they end up at the package root (alongside genai_config.json),
+                # not duplicated into each <component>/ subdirectory.
+                "additional_files": sorted(set(genai_artifacts.values())),
+                **(model.model_attributes or {}),
+            },
+        )
+
+    @staticmethod
+    def _write_genai_config(pkg, output_dir: str, model_id: str, ep: str) -> dict[str, str]:
+        """Generate ORT GenAI config artifacts alongside the ONNX models.
+
+        Returns:
+            Dict mapping artifact names to their file paths (e.g., genai_config.json, tokenizer.json).
+
+        """
+        from mobius.integrations.ort_genai import write_ort_genai_config
+
+        genai_artifacts = write_ort_genai_config(
+            pkg,
+            output_dir,
+            hf_model_id=model_id,
+            ep=ep,
+        )
+        logger.info(
+            "MobiusBuilder: wrote ORT GenAI config: %s",
+            list(genai_artifacts.keys()),
+        )
+        return genai_artifacts

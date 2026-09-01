@@ -11,10 +11,12 @@ from olive.cli.base import (
     add_logging_options,
     add_save_config_file_options,
     add_shared_cache_options,
+    add_telemetry_options,
     get_input_model_config,
     update_shared_cache_options,
 )
 from olive.common.utils import set_nested_dict_value
+from olive.telemetry import action
 
 
 class BenchmarkCommand(BaseOliveCLICommand):
@@ -66,11 +68,25 @@ class BenchmarkCommand(BaseOliveCLICommand):
             help="Number (or percentage of dataset) of samples to use for evaluation.",
         )
 
+        lmeval_group.add_argument(
+            "--backend",
+            type=str,
+            default="auto",
+            choices=["auto", "ort", "ortgenai"],
+            help=(
+                "Backend for lm-eval model evaluation. 'ort' and 'ortgenai' require ONNX input; "
+                "'ortgenai' additionally requires GenAI-packaged model assets (e.g., genai_config.json). "
+                "'auto' infers backend from model type."
+            ),
+        )
+
         add_logging_options(sub_parser)
         add_save_config_file_options(sub_parser)
         add_shared_cache_options(sub_parser)
+        add_telemetry_options(sub_parser)
         sub_parser.set_defaults(func=BenchmarkCommand)
 
+    @action
     def run(self):
         return self._run_workflow()
 
@@ -81,7 +97,11 @@ class BenchmarkCommand(BaseOliveCLICommand):
         assert input_model_config["type"].lower() in {
             "hfmodel",
             "pytorchmodel",
-        }, "Only HfModel and PyTorchModel are supported in benchmark command."
+            "onnxmodel",
+        }, "Only HfModel, PyTorchModel and OnnxModel are supported in benchmark command."
+
+        if self.args.backend != "auto" and input_model_config["type"].lower() != "onnxmodel":
+            raise ValueError("--backend is only supported for ONNX input models.")
 
         to_replace = [
             ("input_model", input_model_config),
@@ -96,8 +116,11 @@ class BenchmarkCommand(BaseOliveCLICommand):
             (("evaluators", "evaluator", "device"), self.args.device),
             (("evaluators", "evaluator", "batch_size"), self.args.batch_size),
             (("evaluators", "evaluator", "max_length"), self.args.max_length),
-            (("evaluators", "evaluator", "device"), self.args.device),
             (("evaluators", "evaluator", "limit"), self.args.limit),
+            (
+                ("evaluators", "evaluator", "model_class"),
+                None if self.args.backend == "auto" else self.args.backend,
+            ),
         ]
 
         for keys, value in to_replace:

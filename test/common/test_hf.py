@@ -2,13 +2,45 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from transformers import BertConfig, GPT2Config, Qwen3Config
 
-from olive.common.hf.model_io import get_export_config, get_model_dummy_input, get_model_io_config
-from olive.common.hf.utils import load_model_from_task
+from olive.common.hf.model_io import get_model_dummy_input, get_model_io_config
+from olive.common.hf.utils import (
+    TEST_MODEL_MARKER_FILE,
+    _apply_test_model_config,
+    _load_test_model,
+    load_model_from_task,
+)
+
+
+def test_apply_test_model_config_reduces_encoder_decoder_layers_consistently():
+    """Encoder-decoder models (e.g. Whisper) must reduce encoder AND decoder layer counts together.
+
+    Reducing only num_hidden_layers while leaving encoder_layers/decoder_layers unchanged produces an
+    inconsistent model whose exported ONNX decoder emits more cross-attention KV outputs than the
+    GenAI config expects, causing onnxruntime-genai to fail with "Invalid output name:
+    present_key_cross_*".
+    """
+    from transformers import WhisperConfig
+
+    reduced = _apply_test_model_config(WhisperConfig(), {"hidden_layers": 2})
+    assert reduced.encoder_layers == 2
+    assert reduced.decoder_layers == 2
+    assert reduced.num_hidden_layers == 2
+
+
+def test_apply_test_model_config_reduces_nested_vision_depth():
+    model_config = SimpleNamespace(vision_config=SimpleNamespace(depth=24))
+
+    reduced = _apply_test_model_config(model_config, {"hidden_layers": 2})
+
+    assert reduced.vision_config.depth == 2
 
 
 def test_load_model_from_task():
@@ -19,6 +51,366 @@ def test_load_model_from_task():
 
     model = load_model_from_task(task, model_name)
     assert isinstance(model, torch.nn.Module)
+
+
+@pytest.mark.parametrize(
+    ("model_config", "hidden_layers_attr"),
+    [
+        (BertConfig(num_hidden_layers=12), "num_hidden_layers"),  # pylint: disable=unexpected-keyword-arg
+        (GPT2Config(n_layer=12), "n_layer"),  # pylint: disable=unexpected-keyword-arg
+    ],
+)
+def test_load_model_from_task_test_model_config(model_config, hidden_layers_attr):
+    created_model = MagicMock(spec=torch.nn.Module)
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config) as mock_from_pretrained,
+    ):
+        mock_model_class = MagicMock()
+        mock_model_class.from_config.return_value = created_model
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        model = load_model_from_task("text-classification", "dummy-model", test_model_config={"hidden_layers": 2})
+
+    assert model is created_model
+    mock_from_pretrained.assert_called_once()
+    mock_model_class.from_config.assert_called_once()
+    assert getattr(mock_model_class.from_config.call_args.args[0], hidden_layers_attr) == 2
+
+
+def test_get_model_class_from_config_resolves_declared_architecture():
+    from transformers import WhisperConfig, WhisperForConditionalGeneration
+
+    from olive.common.hf.utils import get_model_class_from_config
+
+    config = WhisperConfig(architectures=["WhisperForConditionalGeneration"])  # pylint: disable=unexpected-keyword-arg
+    assert get_model_class_from_config(config) is WhisperForConditionalGeneration
+
+
+def test_get_model_class_from_config_returns_none_when_unresolvable():
+    from olive.common.hf.utils import get_model_class_from_config
+
+    # No architectures declared.
+    assert get_model_class_from_config(BertConfig()) is None
+    # Architecture name not present in the transformers namespace (e.g. custom remote-code model).
+    assert (
+        get_model_class_from_config(BertConfig(architectures=["TotallyNotARealArchitecture"]))  # pylint: disable=unexpected-keyword-arg
+        is None
+    )
+
+
+def test_load_model_from_task_test_model_config_prefers_config_architecture():
+    """In --test mode the reference model class comes from config.architectures, not the task.
+
+    A seq2seq model such as Whisper must not be coerced into a decoder-only *ForCausalLM head just
+    because the default task is text-generation.
+    """
+    from transformers import WhisperConfig, WhisperForConditionalGeneration
+
+    model_config = WhisperConfig(architectures=["WhisperForConditionalGeneration"])  # pylint: disable=unexpected-keyword-arg
+    created_model = MagicMock(spec=torch.nn.Module)
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+        patch("olive.common.hf.utils._load_test_model", return_value=created_model) as mock_load_test_model,
+    ):
+        # The task resolves to a causal-LM class, which must be ignored in favor of the config arch.
+        mock_check_task.return_value = ("text-generation", {"pt": (MagicMock(),)}, None)
+
+        model = load_model_from_task("text-generation-with-past", "dummy-model", test_model_config={"hidden_layers": 2})
+
+    assert model is created_model
+    mock_load_test_model.assert_called_once()
+    assert mock_load_test_model.call_args.args[0] is WhisperForConditionalGeneration
+
+
+def test_load_model_from_task_test_model_config_saves_tokenizer(tmp_path):
+    """The reference tokenizer should be saved into the test model directory."""
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    created_model = MagicMock()
+    test_model_path = tmp_path / "saved_test_model"
+    mock_tokenizer = MagicMock()
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+        patch("olive.common.hf.utils.get_tokenizer", return_value=mock_tokenizer) as mock_get_tokenizer,
+        patch("olive.common.hf.utils.save_tokenizer") as mock_save_tokenizer,
+    ):
+        mock_model_class = MagicMock()
+        mock_model_class.from_config.return_value = created_model
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        load_model_from_task(
+            "text-classification",
+            "dummy-model",
+            test_model_config={"num_hidden_layers": 2},
+            test_model_path=str(test_model_path),
+        )
+
+    mock_get_tokenizer.assert_called_once_with("dummy-model")
+    mock_save_tokenizer.assert_called_once_with(mock_tokenizer, str(test_model_path))
+
+
+def test_load_model_from_task_test_model_config_saves_processor(tmp_path):
+    """A speech/multimodal model's processor should be saved into the test model directory."""
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    created_model = MagicMock()
+    test_model_path = tmp_path / "saved_test_model"
+    # A feature-extractor-style processor (not a tokenizer) should be persisted so that
+    # preprocessor_config.json ends up in the reference model directory (e.g. for Whisper).
+    mock_processor = MagicMock()
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+        patch("olive.common.hf.utils.get_tokenizer", return_value=MagicMock()),
+        patch("olive.common.hf.utils.save_tokenizer"),
+        patch("transformers.AutoProcessor.from_pretrained", return_value=mock_processor) as mock_get_processor,
+    ):
+        mock_model_class = MagicMock()
+        mock_model_class.from_config.return_value = created_model
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        load_model_from_task(
+            "text-classification",
+            "dummy-model",
+            test_model_config={"num_hidden_layers": 2},
+            test_model_path=str(test_model_path),
+        )
+
+    mock_get_processor.assert_called_once_with("dummy-model")
+    mock_processor.save_pretrained.assert_called_once_with(str(test_model_path))
+
+
+def test_load_model_from_task_test_model_config_skips_tokenizer_only_processor(tmp_path):
+    """When AutoProcessor returns a plain tokenizer, it should not be re-saved as a processor."""
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    created_model = MagicMock()
+    test_model_path = tmp_path / "saved_test_model"
+    # Text-only models return a tokenizer from AutoProcessor; it must not be saved via the processor path.
+    mock_processor = MagicMock(spec=PreTrainedTokenizerBase)
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+        patch("olive.common.hf.utils.get_tokenizer", return_value=MagicMock()),
+        patch("olive.common.hf.utils.save_tokenizer"),
+        patch("transformers.AutoProcessor.from_pretrained", return_value=mock_processor),
+    ):
+        mock_model_class = MagicMock()
+        mock_model_class.from_config.return_value = created_model
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        load_model_from_task(
+            "text-classification",
+            "dummy-model",
+            test_model_config={"num_hidden_layers": 2},
+            test_model_path=str(test_model_path),
+        )
+
+    mock_processor.save_pretrained.assert_not_called()
+
+
+def test_load_model_from_task_test_model_config_fails_without_fallback():
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+    ):
+        first_model_class = MagicMock()
+        first_model_class.from_config.side_effect = ValueError("unexpected architecture")
+        second_model_class = MagicMock()
+        second_model_class.from_config.return_value = MagicMock(spec=torch.nn.Module)
+        mock_check_task.return_value = ("text-classification", {"pt": (first_model_class, second_model_class)}, None)
+
+        with pytest.raises(ValueError, match="unexpected architecture"):
+            load_model_from_task("text-classification", "dummy-model", test_model_config={"hidden_layers": 2})
+
+    first_model_class.from_config.assert_called_once()
+    second_model_class.from_config.assert_not_called()
+
+
+def test_load_model_from_task_test_model_config_saves_model(tmp_path):
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    created_model = MagicMock()
+    test_model_path = tmp_path / "saved_test_model"
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+    ):
+        mock_model_class = MagicMock()
+        mock_model_class.from_config.return_value = created_model
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        model = load_model_from_task(
+            "text-classification",
+            "dummy-model",
+            test_model_config={"num_hidden_layers": 2},
+            test_model_path=str(test_model_path),
+        )
+
+    assert model is created_model
+    mock_model_class.from_config.assert_called_once()
+    created_model.save_pretrained.assert_called_once_with(str(test_model_path))
+    assert json.loads((test_model_path / TEST_MODEL_MARKER_FILE).read_text())["type"] == "olive_hf_test_model"
+
+
+def test_load_model_from_task_test_model_config_reuses_saved_model(tmp_path):
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    test_model_path = tmp_path / "saved_test_model"
+    test_model_path.mkdir()
+    (test_model_path / "config.json").write_text("{}")
+    (test_model_path / TEST_MODEL_MARKER_FILE).write_text(json.dumps({"type": "olive_hf_test_model"}))
+    # Add a dummy weight shard so the weights-present branch is exercised.
+    (test_model_path / "model.safetensors").write_bytes(b"dummy")
+    loaded_model = MagicMock(spec=torch.nn.Module)
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch(
+            "olive.common.hf.utils.from_pretrained", side_effect=[model_config, loaded_model]
+        ) as mock_from_pretrained,
+    ):
+        mock_model_class = MagicMock()
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        model = load_model_from_task(
+            "text-classification",
+            "dummy-model",
+            test_model_config={"num_hidden_layers": 2},
+            test_model_path=str(test_model_path),
+        )
+
+    assert model is loaded_model
+    mock_model_class.from_config.assert_not_called()
+    assert mock_from_pretrained.call_args_list[1].args[1] == str(test_model_path)
+
+
+def test_load_model_from_task_test_model_config_completes_config_only_dir(tmp_path):
+    """A config-only test model dir (created during --dry_run) should be completed with weights."""
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    test_model_path = tmp_path / "config_only_test_model"
+    test_model_path.mkdir()
+    # Simulate a config-only dir created by save_test_model_config during --dry_run:
+    # has config.json + marker but no weight shards.
+    (test_model_path / "config.json").write_text("{}")
+    (test_model_path / TEST_MODEL_MARKER_FILE).write_text(json.dumps({"type": "olive_hf_test_model"}))
+    created_model = MagicMock()
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+    ):
+        mock_model_class = MagicMock()
+        mock_model_class.from_config.return_value = created_model
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        model = load_model_from_task(
+            "text-classification",
+            "dummy-model",
+            test_model_config={"num_hidden_layers": 2},
+            test_model_path=str(test_model_path),
+        )
+
+    assert model is created_model
+    mock_model_class.from_config.assert_called_once()
+    created_model.save_pretrained.assert_called_once_with(str(test_model_path))
+
+
+def test_load_model_from_task_test_model_config_rejects_non_test_model_dir(tmp_path):
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    test_model_path = tmp_path / "saved_test_model"
+    test_model_path.mkdir()
+    (test_model_path / "config.json").write_text("{}")
+
+    with (
+        patch("transformers.pipelines.check_task") as mock_check_task,
+        patch("olive.common.hf.utils.from_pretrained", return_value=model_config),
+    ):
+        mock_model_class = MagicMock()
+        mock_check_task.return_value = ("text-classification", {"pt": (mock_model_class,)}, None)
+
+        with pytest.raises(ValueError, match="is not an Olive test model directory"):
+            load_model_from_task(
+                "text-classification",
+                "dummy-model",
+                test_model_config={"num_hidden_layers": 2},
+                test_model_path=str(test_model_path),
+            )
+
+    mock_model_class.from_config.assert_not_called()
+
+
+def test_apply_test_model_config_updates_qwen3_layer_types():
+    model_config = Qwen3Config()
+    model_config.num_hidden_layers = 4
+    model_config.layer_types = model_config.layer_types[:4]
+
+    updated_config = _apply_test_model_config(model_config, {"hidden_layers": 2})
+
+    assert updated_config.num_hidden_layers == 2
+    assert updated_config.layer_types == model_config.layer_types[:2]
+    reloaded_config = Qwen3Config(**updated_config.to_dict())
+    assert reloaded_config.num_hidden_layers == 2
+    assert len(reloaded_config.layer_types) == 2
+    assert reloaded_config.layer_types == model_config.layer_types[:2]
+
+
+def test_load_test_model_omits_unsupported_trust_remote_code_kwarg():
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    captured = {}
+
+    class MockModelClass:
+        @staticmethod
+        def from_config(config):
+            captured["config"] = config
+            return config
+
+    created_model = _load_test_model(MockModelClass, model_config, trust_remote_code=True)
+
+    assert created_model is model_config
+    assert captured == {"config": model_config}
+
+
+def test_load_test_model_omits_none_trust_remote_code_kwarg():
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    captured = {}
+
+    class MockModelClass:
+        @staticmethod
+        def from_config(config, **kwargs):
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+            return config
+
+    created_model = _load_test_model(MockModelClass, model_config)
+
+    assert created_model is model_config
+    assert captured == {"config": model_config, "kwargs": {}}
+
+
+def test_load_test_model_passes_supported_trust_remote_code_kwarg():
+    model_config = BertConfig(num_hidden_layers=12)  # pylint: disable=unexpected-keyword-arg
+    captured = {}
+
+    class MockModelClass:
+        @staticmethod
+        def from_config(config, trust_remote_code=None):
+            captured["config"] = config
+            captured["trust_remote_code"] = trust_remote_code
+            return config
+
+    created_model = _load_test_model(MockModelClass, model_config, trust_remote_code=True)
+
+    assert created_model is model_config
+    assert captured == {"config": model_config, "trust_remote_code": True}
 
 
 @pytest.mark.parametrize(
@@ -62,20 +454,6 @@ def test_load_model_from_task_exception_handling(_, exceptions, expected_excepti
                 _ = load_model_from_task("text-classification", "dummy-model-name")
 
 
-@pytest.mark.parametrize(
-    ("model_name", "task"),
-    [
-        ("hf-internal-testing/tiny-random-BertForSequenceClassification", "text-classification"),
-        ("hf-internal-testing/tiny-random-LlamaForCausalLM", "text-generation"),
-    ],
-)
-def test_get_export_config(model_name, task):
-    from optimum.exporters.onnx import OnnxConfig
-
-    export_config = get_export_config(model_name, task)
-    assert isinstance(export_config, OnnxConfig)
-
-
 def get_model_name_task(with_past: bool):
     model_name = "hf-internal-testing/tiny-random-LlamaForCausalLM"
     task = "text-generation"
@@ -112,11 +490,3 @@ def test_get_model_io_config(use_cache, with_past):
     assert io_config["input_names"] == expected_input_names
     assert io_config["output_names"] == expected_output_names
     assert set(io_config["dynamic_axes"].keys()) == set(expected_input_names + expected_output_names)
-    # dynamic_shapes has nested past_key_values and only includes input names
-    if with_past:
-        assert (
-            len(expected_input_names)
-            == len(io_config["dynamic_shapes"]) - 1 + len(io_config["dynamic_shapes"]["past_key_values"]) * 2
-        )
-    else:
-        assert len(expected_input_names) == len(io_config["dynamic_shapes"])

@@ -6,10 +6,11 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from olive.cli.base import TEST_OUTPUT_MARKER_FILE
 from olive.cli.launcher import main as cli_main
 
 
@@ -24,6 +25,7 @@ from olive.cli.launcher import main as cli_main
         "tune-session-params",
         "auto-opt",
         "optimize",
+        "diffusion-lora",
     ],
 )
 def test_valid_command(console_script, command):
@@ -111,8 +113,71 @@ def test_workflow_run_command(mock_run, tempdir, list_required_packages, tmp_pat
 
 
 @patch("olive.workflows.run")
-def test_workflow_run_command_with_overrides(mock_run, tmp_path):
+def test_workflow_run_command_prints_build_outputs(mock_run, tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "builds": {
+                    "_default": {"output_dir": "out/default"},
+                    "first": {"pipeline": ["convert"]},
+                    "second": {"pipeline": ["convert"], "output_dir": "out/second"},
+                    "missing": {"pipeline": ["convert"], "output_dir": "out/missing"},
+                }
+            }
+        )
+    )
+    output = MagicMock()
+    output.has_output_model.return_value = True
+    missing_output = MagicMock()
+    missing_output.has_output_model.return_value = False
+    mock_run.return_value = {"first": output, "second": output, "missing": missing_output}
+
+    cli_main(["run", "--run-config", str(config_path)])
+
+    stdout = capsys.readouterr().out
+    assert f"Build 'first': model is saved under {Path('out/default') / 'first'}" in stdout
+    assert "Build 'second': model is saved under out/second" in stdout
+    assert "Build 'missing': no output model produced" in stdout
+
+
+def test_workflow_run_command_rejects_test_with_builds(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "builds": {
+                    "only": {"pipeline": ["convert"], "output_dir": "out/only"},
+                }
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="not supported with multi-build"):
+        cli_main(["run", "--run-config", str(config_path), "--test"])
+
+
+def test_workflow_run_command_rejects_output_path_with_builds(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "builds": {
+                    "only": {"pipeline": ["convert"], "output_dir": "out/only"},
+                }
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"default output/<build_name>"):
+        cli_main(["run", "--run-config", str(config_path), "--output_path", str(tmp_path / "output")])
+
+
+@patch("olive.workflows.run")
+@patch("huggingface_hub.repo_exists", return_value=True)
+def test_workflow_run_command_with_overrides(mock_repo_exists, mock_run, tmp_path):
     # setup
+    # Prevent a live Hugging Face repo lookup when the CLI resolves the HF input model override.
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps({"input_model": {"key": "value"}, "engine": {"log_severity_level": 3}, "output_dir": "output"})
@@ -137,7 +202,7 @@ def test_workflow_run_command_with_overrides(mock_run, tmp_path):
             "input_model": {
                 "type": "HfModel",
                 "model_path": "hf-internal-testing/tiny-random-LlamaForCausalLM",
-                "load_kwargs": {"attn_implementation": "eager", "trust_remote_code": False},
+                "load_kwargs": {"attn_implementation": "sdpa", "trust_remote_code": False},
             },
             "engine": {},
             "output_dir": str(Path("new_output_path").resolve()),
@@ -147,6 +212,114 @@ def test_workflow_run_command_with_overrides(mock_run, tmp_path):
         package_config=None,
         tempdir=None,
     )
+
+
+@patch("olive.workflows.run")
+def test_workflow_run_command_with_test_override(mock_run, tmp_path):
+    mock_run.return_value = None
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "input_model": {
+                    "type": "HfModel",
+                    "model_path": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+                    "load_kwargs": {"attn_implementation": "sdpa", "trust_remote_code": False},
+                },
+                "output_dir": str(tmp_path / "output"),
+            }
+        )
+    )
+    command_args = ["run", "--run-config", str(config_path), "--test"]
+
+    cli_main(command_args)
+
+    test_model_path = str(tmp_path / "output" / "reference_hf_model")
+    output_dir = str(tmp_path / "output")
+    mock_run.assert_called_once_with(
+        {
+            "input_model": {
+                "type": "HfModel",
+                "model_path": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+                "load_kwargs": {"attn_implementation": "sdpa", "trust_remote_code": False},
+                "test_model_config": {"hidden_layers": 2},
+                "test_model_path": test_model_path,
+            },
+            "output_dir": output_dir,
+            "passes": {
+                "save_test_model_config": {"type": "SaveTestModelConfig"},
+                "discrepancy_check": {
+                    "type": "OnnxDiscrepancyCheck",
+                    "reference_model_path": test_model_path,
+                    "report_output_dir": output_dir,
+                    "test_metrics": ["mae"],
+                    "max_mae": 0.1,
+                    "timing_iterations": 0,
+                },
+            },
+        },
+        list_required_packages=False,
+        package_config=None,
+        tempdir=None,
+    )
+
+
+def test_workflow_run_command_with_test_rejects_non_test_output_dir(tmp_path):
+    config_path = tmp_path / "config.json"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "model.onnx").write_text("existing")
+    config_path.write_text(
+        json.dumps(
+            {
+                "input_model": {
+                    "type": "HfModel",
+                    "model_path": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+                    "load_kwargs": {"attn_implementation": "sdpa", "trust_remote_code": False},
+                },
+                "output_dir": str(output_dir),
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="is not marked as an Olive test output directory"):
+        cli_main(["run", "--run-config", str(config_path), "--test"])
+
+
+@patch("olive.workflows.run")
+def test_workflow_run_command_with_test_reuses_test_output_dir(mock_run, tmp_path):
+    mock_run.return_value = None
+    config_path = tmp_path / "config.json"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / TEST_OUTPUT_MARKER_FILE).write_text(json.dumps({"type": "olive_hf_test_output"}))
+    config_path.write_text(
+        json.dumps(
+            {
+                "input_model": {
+                    "type": "HfModel",
+                    "model_path": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+                    "load_kwargs": {"attn_implementation": "eager", "trust_remote_code": False},
+                },
+                "output_dir": str(output_dir),
+            }
+        )
+    )
+
+    cli_main(["run", "--run-config", str(config_path), "--test"])
+
+    mock_run.assert_called_once()
+    assert json.loads((output_dir / TEST_OUTPUT_MARKER_FILE).read_text())["type"] == "olive_hf_test_output"
+
+
+def test_workflow_run_command_with_test_requires_hf_input_model(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"input_model": {"type": "OnnxModel", "model_path": "model.onnx"}}))
+
+    with pytest.raises(
+        ValueError, match=r"--test for olive run requires a Hugging Face input_model in the run config\."
+    ):
+        cli_main(["run", "--run-config", str(config_path), "--test"])
 
 
 @patch("olive.platform_sdk.qualcomm.configure.configure.configure")
@@ -186,6 +359,68 @@ def test_finetune_command(_, mock_run, tmp_path):
 
     config = mock_run.call_args[0][0]
     assert config["input_model"]["model_path"] == model_id
+    assert mock_run.call_count == 1
+
+
+@patch("huggingface_hub.repo_exists", return_value=True)
+def test_optimize_command_test_model_config(_, tmp_path):
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "optimize",
+        "-m",
+        "dummy-model-id",
+        "--test",
+        "--dry_run",
+        "-o",
+        str(output_dir),
+    ]
+
+    cli_main(command_args)
+
+    config = json.loads((output_dir / "config.json").read_text())
+    assert config["input_model"]["test_model_config"] == {"hidden_layers": 2}
+    assert config["input_model"]["test_model_path"] == str(output_dir / "reference_hf_model")
+    assert json.loads((output_dir / TEST_OUTPUT_MARKER_FILE).read_text())["type"] == "olive_hf_test_output"
+
+
+@patch("olive.workflows.run")
+@patch("olive.model.handler.diffusers.is_valid_diffusers_model", return_value=True)
+def test_diffusion_lora_command(_, mock_run, tmp_path):
+    # setup
+    output_dir = tmp_path / "output_dir"
+    data_dir = tmp_path / "train_images"
+    data_dir.mkdir()
+
+    # Create dummy training images
+    from PIL import Image
+
+    for i in range(2):
+        img = Image.new("RGB", (64, 64), color=(i * 50, i * 50, i * 50))
+        img.save(data_dir / f"image_{i}.png")
+        (data_dir / f"image_{i}.txt").write_text(f"a test image {i}")
+
+    model_id = "runwayml/stable-diffusion-v1-5"
+    command_args = [
+        "diffusion-lora",
+        "-m",
+        model_id,
+        "-d",
+        str(data_dir),
+        "-o",
+        str(output_dir),
+        "--model_type",
+        "sd",
+        "--max_train_steps",
+        "1",
+    ]
+
+    # execute
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert config["input_model"]["model_path"] == model_id
+    assert config["input_model"]["type"] == "DiffusersModel"
+    assert "sd_lora" in config["passes"]
     assert mock_run.call_count == 1
 
 
@@ -277,6 +512,90 @@ def test_capture_onnx_command_fix_shape(_, mock_run, use_model_builder, tmp_path
     assert config["passes"]["f"]["dim_param"] == list(fixed_param_dict.keys())
     assert config["passes"]["f"]["dim_value"] == list(fixed_param_dict.values())
     assert mock_run.call_count == 1
+
+
+@patch("olive.workflows.run")
+@patch("huggingface_hub.repo_exists", return_value=True)
+@pytest.mark.parametrize(
+    ("precision", "use_ort_genai"),
+    [
+        ("fp16", True),
+        ("fp32", False),
+        ("bf16", True),
+    ],
+)
+def test_capture_onnx_command_use_mobius_builder(_, mock_run, precision, use_ort_genai, tmp_path):
+    # setup
+    output_dir = tmp_path / "output_dir"
+    model_id = "dummy-model-id"
+    command_args = [
+        "capture-onnx-graph",
+        "-m",
+        model_id,
+        "-o",
+        str(output_dir),
+        "--use_mobius_builder",
+        "--precision",
+        precision,
+    ]
+    if use_ort_genai:
+        command_args.append("--use_ort_genai")
+
+    # execute
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert config["input_model"]["model_path"] == model_id
+    # MobiusBuilder ("b") is the only conversion pass; "c" (OnnxConversion) and "m" (ModelBuilder) are removed.
+    assert "b" in config["passes"]
+    assert "c" not in config["passes"]
+    assert "m" not in config["passes"]
+    assert config["passes"]["b"]["type"] == "MobiusBuilder"
+    assert config["passes"]["b"]["precision"] == precision
+    assert mock_run.call_count == 1
+
+
+@patch("olive.workflows.run")
+@patch("huggingface_hub.repo_exists", return_value=True)
+def test_capture_onnx_command_use_mobius_builder_rejects_int4(_, __, tmp_path):
+    # setup
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "capture-onnx-graph",
+        "-m",
+        "dummy-model-id",
+        "-o",
+        str(output_dir),
+        "--use_mobius_builder",
+        "--precision",
+        "int4",
+    ]
+
+    # execute / verify
+    with pytest.raises(ValueError, match="MobiusBuilder supports precisions fp32/fp16/bf16"):
+        cli_main(command_args)
+
+
+@patch("olive.workflows.run")
+@patch("huggingface_hub.repo_exists", return_value=True)
+@pytest.mark.parametrize("conflicting_flag", ["--use_model_builder", "--use_dynamo_exporter"])
+def test_capture_onnx_command_use_mobius_builder_rejects_conflicts(_, __, conflicting_flag, tmp_path):
+    # setup
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "capture-onnx-graph",
+        "-m",
+        "dummy-model-id",
+        "-o",
+        str(output_dir),
+        "--use_mobius_builder",
+        conflicting_flag,
+    ]
+
+    # execute / verify
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(command_args)
+    assert exc_info.value.code == 2
 
 
 @patch("olive.cli.shared_cache.AzureContainerClientFactory")
@@ -451,6 +770,8 @@ def test_optimize_cli_pass_list(mock_repo_exists, mock_run, tmp_path):
     # setup
     output_dir = "output_dir"
 
+    # Each entry: [command, args, expected_passes, expected_device, expected_ep]
+    # expected_device is None when --device is not specified (olive infers it at runtime)
     test_list = [
         [
             "optimize",
@@ -462,6 +783,8 @@ def test_optimize_cli_pass_list(mock_repo_exists, mock_run, tmp_path):
                 "QuaRot, Gptq, CaptureSplitInfo, ModelBuilder, MatMulNBitsToQDQ, GraphSurgeries, "
                 "OnnxStaticQuantization, SplitModel, StaticLLM"
             ),
+            None,
+            "QNNExecutionProvider",
         ],
         [
             "optimize",
@@ -473,16 +796,22 @@ def test_optimize_cli_pass_list(mock_repo_exists, mock_run, tmp_path):
                 "QuaRot, Gptq, CaptureSplitInfo, ModelBuilder, MatMulNBitsToQDQ, GraphSurgeries, "
                 "OnnxStaticQuantization, VitisAIAddMetaData, SplitModel, StaticLLM"
             ),
+            None,
+            "VitisAIExecutionProvider",
         ],
         [
             "optimize",
             "--precision int4 --act_precision int16 --provider OpenVINOExecutionProvider  --device gpu",
             "OpenVINOOptimumConversion, OpenVINOIoUpdate, OpenVINOEncapsulation",
+            "gpu",
+            "OpenVINOExecutionProvider",
         ],
         [
             "optimize",
             "-t text-classification --precision int8 --exporter torchscript_exporter",
             "OnnxConversion, OnnxPeepholeOptimizer, OrtTransformersOptimization, OnnxStaticQuantization",
+            None,
+            "CPUExecutionProvider",
         ],
         [
             "optimize",
@@ -494,11 +823,22 @@ def test_optimize_cli_pass_list(mock_repo_exists, mock_run, tmp_path):
                 "OnnxConversion, DynamicToFixedShape, OnnxPeepholeOptimizer, OrtTransformersOptimization, "
                 "OnnxStaticQuantization, StaticLLM"
             ),
+            "npu",
+            "QNNExecutionProvider",
         ],
         [
             "optimize",
             "-t text-classification --precision fp16 --exporter torchscript_exporter --provider CUDAExecutionProvider",
             "OnnxConversion, OnnxPeepholeOptimizer, OrtTransformersOptimization, OnnxFloatToFloat16",
+            None,
+            "CUDAExecutionProvider",
+        ],
+        [
+            "optimize",
+            "--precision fp16 --provider CUDAExecutionProvider",
+            "ModelBuilder",
+            None,
+            "CUDAExecutionProvider",
         ],
         [
             "optimize",
@@ -507,6 +847,8 @@ def test_optimize_cli_pass_list(mock_repo_exists, mock_run, tmp_path):
                 " NvTensorRTRTXExecutionProvider --device gpu"
             ),
             "OnnxConversion, OnnxPeepholeOptimizer, OnnxFloatToFloat16",
+            "gpu",
+            "NvTensorRTRTXExecutionProvider",
         ],
     ]
 
@@ -535,10 +877,24 @@ def test_optimize_cli_pass_list(mock_repo_exists, mock_run, tmp_path):
 
         assert pass_list == [item.strip() for item in t[2].split(",")]
 
+        # Verify system config has correct device and execution provider
+        accelerator = data["systems"]["local_system"]["accelerators"][0]
+        expected_device = t[3]
+        expected_ep = t[4]
+        if expected_device is None:
+            assert "device" not in accelerator, f"Expected no device but got '{accelerator.get('device')}'"
+        else:
+            assert accelerator["device"] == expected_device, (
+                f"Expected device '{expected_device}' but got '{accelerator.get('device')}'"
+            )
+        assert accelerator["execution_providers"] == [expected_ep], (
+            f"Expected EP '{expected_ep}' but got '{accelerator['execution_providers']}'"
+        )
+
 
 @patch("olive.workflows.run")
 @patch("huggingface_hub.repo_exists", return_value=True)
-def test_benchmark_command(_, mock_run, tmp_path):
+def test_benchmark_command_hfmodel(_, mock_run, tmp_path):
     # setup
     output_dir = tmp_path / "output_dir"
     model_id = "dummy-model-id"
@@ -570,4 +926,177 @@ def test_benchmark_command(_, mock_run, tmp_path):
     assert config["evaluators"]["evaluator"]["batch_size"] == 8
     assert config["evaluators"]["evaluator"]["max_length"] == 1024
     assert config["evaluators"]["evaluator"]["limit"] == 16
+    assert "model_class" not in config["evaluators"]["evaluator"]
+    assert mock_run.call_count == 1
+
+
+@patch("olive.workflows.run")
+def test_benchmark_command_onnxmodel(mock_run, tmp_path):
+    from test.utils import ONNX_MODEL_PATH
+
+    # some directories
+    output_dir = tmp_path / "output_dir"
+
+    # setup
+    command_args = [
+        "benchmark",
+        "-m",
+        str(ONNX_MODEL_PATH),
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "helloswag",
+        "--device",
+        "gpu",
+        "--batch_size",
+        "8",
+        "--max_length",
+        "1024",
+        "--limit",
+        "16",
+    ]
+
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert config["input_model"]["model_path"] == str(ONNX_MODEL_PATH)
+    assert config["evaluators"]["evaluator"]["tasks"] == ["arc_easy", "helloswag"]
+    assert config["evaluators"]["evaluator"]["batch_size"] == 8
+    assert config["evaluators"]["evaluator"]["max_length"] == 1024
+    assert config["evaluators"]["evaluator"]["limit"] == 16
+    assert "model_class" not in config["evaluators"]["evaluator"]
+    assert mock_run.call_count == 1
+
+
+@patch("olive.workflows.run")
+def test_benchmark_command_onnxmodel_with_ort_backend(mock_run, tmp_path):
+    from test.utils import ONNX_MODEL_PATH
+
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "benchmark",
+        "-m",
+        str(ONNX_MODEL_PATH),
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "--backend",
+        "ort",
+    ]
+
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert config["evaluators"]["evaluator"]["model_class"] == "ort"
+    assert mock_run.call_count == 1
+
+
+@patch("olive.workflows.run")
+def test_benchmark_command_onnxmodel_with_ortgenai_backend(mock_run, tmp_path):
+    from test.utils import ONNX_MODEL_PATH
+
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "benchmark",
+        "-m",
+        str(ONNX_MODEL_PATH),
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "--backend",
+        "ortgenai",
+    ]
+
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert config["evaluators"]["evaluator"]["model_class"] == "ortgenai"
+    assert mock_run.call_count == 1
+
+
+@patch("huggingface_hub.repo_exists", return_value=True)
+def test_benchmark_command_non_onnx_model_with_backend_option_raises(_, tmp_path):
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "benchmark",
+        "-m",
+        "dummy-model-id",
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "--backend",
+        "ortgenai",
+    ]
+
+    with pytest.raises(ValueError, match="--backend is only supported for ONNX input models"):
+        cli_main(command_args)
+
+
+@patch("huggingface_hub.repo_exists", return_value=True)
+def test_benchmark_command_non_onnx_model_with_ort_backend_raises(_, tmp_path):
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "benchmark",
+        "-m",
+        "dummy-model-id",
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "--backend",
+        "ort",
+    ]
+
+    with pytest.raises(ValueError, match="--backend is only supported for ONNX input models"):
+        cli_main(command_args)
+
+
+@patch("olive.workflows.run")
+def test_benchmark_command_onnxmodel_with_auto_backend(mock_run, tmp_path):
+    from test.utils import ONNX_MODEL_PATH
+
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "benchmark",
+        "-m",
+        str(ONNX_MODEL_PATH),
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "--backend",
+        "auto",
+    ]
+
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert "model_class" not in config["evaluators"]["evaluator"]
+    assert mock_run.call_count == 1
+
+
+@patch("olive.workflows.run")
+@patch("huggingface_hub.repo_exists", return_value=True)
+def test_benchmark_command_hfmodel_with_auto_backend(_, mock_run, tmp_path):
+    output_dir = tmp_path / "output_dir"
+    command_args = [
+        "benchmark",
+        "-m",
+        "dummy-model-id",
+        "--output_path",
+        str(output_dir),
+        "--tasks",
+        "arc_easy",
+        "--backend",
+        "auto",
+    ]
+
+    cli_main(command_args)
+
+    config = mock_run.call_args[0][0]
+    assert "model_class" not in config["evaluators"]["evaluator"]
     assert mock_run.call_count == 1

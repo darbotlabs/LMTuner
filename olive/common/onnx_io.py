@@ -2,7 +2,30 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
+import json
 import re
+from pathlib import Path
+from typing import Optional, Union
+
+
+def get_genai_decoder_config(model_path: Union[str, Path]) -> Optional[dict]:
+    """Return the decoder section of the genai_config.json saved next to an ONNX model.
+
+    onnxruntime-genai exports some KV cache dimensions symbolically (for example ``kv_cache_dim``)
+    so that a single ONNX model serves both plain and quantized KV caches. The concrete values are
+    only available in the genai_config.json written alongside the model.
+
+    :param model_path: Path to the ONNX model file or to the directory containing it.
+    :return: The ``model.decoder`` section of genai_config.json, or None if there is no such file.
+    """
+    model_path = Path(model_path)
+    model_dir = model_path.parent if model_path.suffix else model_path
+    genai_config_path = model_dir / "genai_config.json"
+    if not genai_config_path.is_file():
+        return None
+
+    with genai_config_path.open() as config_file:
+        return json.load(config_file).get("model", {}).get("decoder")
 
 
 def get_io_config(model_path: str) -> dict:
@@ -89,20 +112,20 @@ def get_kv_info(io_config: dict) -> dict | None:
     if kv_format is None:
         return None
 
-    # find the number of layers
-    num_layers = 0
+    # find the actual layer indices (may be non-contiguous after pruning)
+    layer_indices = set()
     for i_name in io_config["input_names"]:
-        num_layers += int(re.match(kv_format, i_name) is not None)
+        m = re.match(kv_format, i_name)
+        if m:
+            layer_indices.add(int(m.group(1)))
+    layer_indices = sorted(layer_indices)
 
     past_names = []
     present_to_past = {}
     for k in ["key", "value"]:
-        past_names.extend([kv_options[kv_format][f"past_{k}"] % i for i in range(num_layers)])
+        past_names.extend([kv_options[kv_format][f"past_{k}"] % i for i in layer_indices])
         present_to_past.update(
-            {
-                kv_options[kv_format][f"present_{k}"] % i: kv_options[kv_format][f"past_{k}"] % i
-                for i in range(num_layers)
-            }
+            {kv_options[kv_format][f"present_{k}"] % i: kv_options[kv_format][f"past_{k}"] % i for i in layer_indices}
         )
 
     past_shape = io_config["input_shapes"][io_config["input_names"].index(past_names[0])]

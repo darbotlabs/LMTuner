@@ -3,11 +3,11 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 import platform
-import shutil
 from itertools import chain
 from pathlib import Path
 from unittest.mock import patch
 
+import onnx
 import pytest
 import torch
 from onnxscript import ir
@@ -17,7 +17,11 @@ from olive.common.config_utils import validate_config
 from olive.model import PyTorchModelHandler
 from olive.model.config import IoConfig
 from olive.passes.olive_pass import create_pass_from_dict
-from olive.passes.onnx.conversion import OnnxConversion, OnnxOpVersionConversion
+from olive.passes.onnx.conversion import (
+    OnnxConversion,
+    OnnxOpVersionConversion,
+    _patch_dynamic_layer_for_export,
+)
 from olive.passes.pytorch.autogptq import GptqQuantizer
 from olive.passes.pytorch.rtn import Rtn
 from test.utils import (
@@ -35,14 +39,88 @@ def _torch_is_older_than(version_str: str) -> bool:
     return torch_version < version.parse(version_str).release
 
 
+def test_dynamic_layer_export_patch_preserves_key_and_value_shapes():
+    from transformers.cache_utils import DynamicLayer
+
+    original_lazy_initialization = DynamicLayer.lazy_initialization
+    with _patch_dynamic_layer_for_export():
+        layer = DynamicLayer()
+        keys, values = layer.update(torch.ones(1, 2, 1, 16), torch.ones(1, 2, 1, 8))
+        assert keys.shape == (1, 2, 1, 16)
+        assert values.shape == (1, 2, 1, 8)
+
+    assert DynamicLayer.lazy_initialization is original_lazy_initialization
+
+
+def test_dynamic_layer_export_patch_restores_method_on_error():
+    from transformers.cache_utils import DynamicLayer
+
+    original_lazy_initialization = DynamicLayer.lazy_initialization
+    # Use a plain try/except (rather than `pytest.raises`, even nested/separated) so CodeQL's
+    # control-flow analysis can see that the code below is reachable: CodeQL doesn't model
+    # `pytest.raises.__exit__` as suppressing the exception, so it treats any statement after a
+    # `with` block whose body unconditionally raises as unreachable, regardless of an outer
+    # `pytest.raises`. A native try/except is understood correctly.
+    raised = None
+    try:
+        with _patch_dynamic_layer_for_export():
+            raise RuntimeError("export failed")  # noqa: TRY301
+    except RuntimeError as error:
+        raised = error
+    assert raised is not None
+    assert str(raised) == "export failed"
+    assert DynamicLayer.lazy_initialization is original_lazy_initialization
+
+
+def test_dynamic_layer_export_patch_nested_usage_restores_after_outer_exit():
+    from transformers.cache_utils import DynamicLayer
+
+    original_lazy_initialization = DynamicLayer.lazy_initialization
+    with _patch_dynamic_layer_for_export():
+        patched_lazy_initialization = DynamicLayer.lazy_initialization
+        assert patched_lazy_initialization is not original_lazy_initialization
+        with _patch_dynamic_layer_for_export():
+            assert DynamicLayer.lazy_initialization is patched_lazy_initialization
+        assert DynamicLayer.lazy_initialization is patched_lazy_initialization
+
+    assert DynamicLayer.lazy_initialization is original_lazy_initialization
+
+
+def test_dynamic_layer_export_patch_non_lifo_overlapping_usage_restores_after_last_exit():
+    from transformers.cache_utils import DynamicLayer
+
+    original_lazy_initialization = DynamicLayer.lazy_initialization
+    context_a = _patch_dynamic_layer_for_export()
+    context_b = _patch_dynamic_layer_for_export()
+    context_a_active = context_b_active = False
+    try:
+        context_a.__enter__()
+        context_a_active = True
+        patched_lazy_initialization = DynamicLayer.lazy_initialization
+        context_b.__enter__()
+        context_b_active = True
+        assert DynamicLayer.lazy_initialization is patched_lazy_initialization
+
+        context_a.__exit__(None, None, None)
+        context_a_active = False
+        assert DynamicLayer.lazy_initialization is patched_lazy_initialization
+
+        context_b.__exit__(None, None, None)
+        context_b_active = False
+        assert DynamicLayer.lazy_initialization is original_lazy_initialization
+    finally:
+        if context_b_active:
+            context_b.__exit__(None, None, None)
+        if context_a_active:
+            context_a.__exit__(None, None, None)
+
+
 @pytest.mark.parametrize(
     ("input_model", "use_dynamo_exporter", "dynamic"),
     [
         (get_hf_model(), True, True),
-        (get_hf_model(), False, True),
         (get_hf_model(), True, False),
         (get_pytorch_model(), True, True),
-        (get_pytorch_model(), False, True),
         (get_pytorch_model(), True, False),
     ],
 )
@@ -58,7 +136,7 @@ def test_onnx_conversion_pass_with_exporters(input_model, use_dynamo_exporter: b
 
 
 @pytest.mark.parametrize("quantizer_pass", [Rtn, GptqQuantizer])
-@pytest.mark.parametrize("use_dynamo_exporter", [False, True])
+@pytest.mark.parametrize("use_dynamo_exporter", [True])
 def test_onnx_conversion_pass_quant_model(quantizer_pass, use_dynamo_exporter: bool, tmp_path):
     if use_dynamo_exporter and platform.system() == "Windows":
         pytest.skip("FIXME: torch ops fails on Windows")
@@ -101,8 +179,11 @@ def test_onnx_conversion_pass_quant_model(quantizer_pass, use_dynamo_exporter: b
     assert num_gbq == expected_num_gbq
 
 
-@pytest.mark.parametrize("target_opset", [9, 10, 16])
+@pytest.mark.parametrize("target_opset", [16, 17, 18])
 def test_onnx_op_version_conversion_pass(target_opset, tmp_path):
+    # Note: The test ONNX model is created with dynamo export at opset 20.
+    # ONNX version converter cannot downgrade Gemm from opset 13+ to opset 9/10,
+    # so we only test conversion to opset 16+.
     input_model = get_onnx_model()
     # setup
     p = create_pass_from_dict(
@@ -199,12 +280,17 @@ def get_dummy_inputs_llama2(_):
 )
 @patch("torch.onnx.export")
 def test_onnx_conversion_with_past_key_values(mock_onnx_export, tmp_path, io_config_func, dummy_inputs_func):
-    dummy_inputs = None
+    dummy_kwargs = None
+
+    class MockOnnxProgram:
+        def __init__(self, model_path):
+            self.model = ir.serde.deserialize_model(onnx.load(model_path))
 
     def mock_onnx_export_func(*args, **kwargs):
-        nonlocal dummy_inputs
-        _, dummy_inputs, output_path = args
-        shutil.copyfile(ONNX_MODEL_PATH, output_path)
+        nonlocal dummy_kwargs
+        # For dynamo export, inputs are passed via kwargs parameter
+        dummy_kwargs = kwargs.get("kwargs", {})
+        return MockOnnxProgram(ONNX_MODEL_PATH)
 
     output_folder = tmp_path / "onnx"
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -216,9 +302,9 @@ def test_onnx_conversion_with_past_key_values(mock_onnx_export, tmp_path, io_con
     )
     mock_onnx_export.side_effect = mock_onnx_export_func
     # setup
-    p = create_pass_from_dict(OnnxConversion, {}, disable_search=True)
+    p = create_pass_from_dict(OnnxConversion, {"use_dynamo_exporter": True}, disable_search=True)
     _ = p.run(input_model, str(output_folder))
-    assert "past_key_values" in dummy_inputs  # pylint: disable=unsupported-membership-test
+    assert "past_key_values" in dummy_kwargs  # pylint: disable=unsupported-membership-test
 
 
 @pytest.mark.parametrize(

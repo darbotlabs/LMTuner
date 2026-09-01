@@ -3,9 +3,11 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import onnx
+import onnx_ir as ir
 
 from olive.hardware import Device
 from olive.hardware.accelerator import AcceleratorSpec
@@ -19,10 +21,24 @@ from olive.passes.onnx.common import (
     resave_model,
     update_llm_pipeline_genai_config_gpu,
 )
-from olive.passes.onnx.onnx_dag import OnnxDAG
 from olive.passes.pass_config import BasePassConfig, PassConfigParam
 
 logger = logging.getLogger(__name__)
+
+
+def _ir_io_shape(value: ir.Value) -> list:
+    """Return the shape of an IR value as a list of ints (static dims) and strings (symbolic dims)."""
+    if value.shape is None:
+        return None
+    return [dim.value if isinstance(dim, ir.SymbolicDim) else dim for dim in value.shape]
+
+
+def _proto_io_shape(model_proto: onnx.ModelProto, name: str) -> list:
+    """Return the shape of a graph input/output as a list of ints and symbolic dim names."""
+    for value_info in list(model_proto.graph.input) + list(model_proto.graph.output):
+        if value_info.name == name:
+            return [dim.dim_param if dim.dim_param else dim.dim_value for dim in value_info.type.tensor_type.shape.dim]
+    return None
 
 
 class StaticLLM(Pass):
@@ -56,10 +72,23 @@ class StaticLLM(Pass):
                 default_value=64,
                 description="Input length of the context model.",
             ),
+            "prefill_decode_models": PassConfigParam(
+                type_=bool,
+                default_value=True,
+                description=("To generate prefill and decode models. Specifically for QNN GPU"),
+            ),
             "group_session_options": PassConfigParam(
                 type_=dict,
                 description=(
                     "Session options for the context and iterator models. Only used for models with genai_config."
+                ),
+            ),
+            "update_genai_config": PassConfigParam(
+                type_=bool,
+                default_value=False,
+                description=(
+                    "Whether to update the genai_config.json pipeline for the generated static LLM model(s)."
+                    " Only applicable to QNN GPU."
                 ),
             ),
         }
@@ -84,14 +113,16 @@ class StaticLLM(Pass):
         )
 
         # only gqa models are supported for now
-        assert (
-            "GroupQueryAttention"
-            in OnnxDAG(onnx.load(model_components[1].model_path, load_external_data=False)).get_node_op_types()
-        ), "Only GQA models are supported for now."
+        transformer_model = ir.from_proto(onnx.load(model_components[1].model_path, load_external_data=False))
+        assert any(node.op_type == "GroupQueryAttention" for node in transformer_model.graph.all_nodes()), (
+            "Only GQA models are supported for now."
+        )
         # get dimension params from embeddings model
-        batch_size, sequence_length = OnnxDAG(
-            onnx.load(model_components[0].model_path, load_external_data=False)
-        ).get_io_shape("input_ids")
+        embedding_model = ir.from_proto(onnx.load(model_components[0].model_path, load_external_data=False))
+        input_ids = embedding_model.graph.inputs[
+            [value.name for value in embedding_model.graph.inputs].index("input_ids")
+        ]
+        batch_size, sequence_length = _ir_io_shape(input_ids)
         assert isinstance(batch_size, str), "Batch size must be a symbolic dimension"
         assert isinstance(sequence_length, str), "Sequence length must be a symbolic dimension"
 
@@ -182,57 +213,159 @@ class StaticLLM(Pass):
         )
 
     def _run_qnn_gpu(self, model: ONNXModelHandler, config: type[BasePassConfig], output_model_path: Path):
+        """QNN_GPU path: generate one or more static ONNX models for different context lengths.
+
+        - If config.prefill_decode_models is false: generate single model.
+        - If config.prefill_decode_models is true: generate multiple models (prefill/arN and decode/ar1) and return
+          CompositeModelHandler.
+        """
         output_model_dir = Path(output_model_path).with_suffix("")
         model_path = Path(model.model_path)
 
         # --- Step 1: Load model (handle both single and external data) ---
         try:
-            model_proto = onnx.load(model_path, load_external_data=True)
+            base_model_proto = onnx.load(model_path, load_external_data=True)
         except Exception as e:
             raise RuntimeError(f"Failed to load ONNX model: {e}") from e
 
         # --- Step 2: Fix symbolic dimensions ---
-        batch_size, sequence_length = OnnxDAG(model_proto).get_io_shape("input_ids")
+        batch_size, sequence_length = _proto_io_shape(base_model_proto, "input_ids")
         if not (isinstance(batch_size, str) and isinstance(sequence_length, str)):
             raise ValueError("Input dimensions must be symbolic before static shape fixing.")
 
-        param_mapping = {batch_size: config.batch_size, sequence_length: config.context_length}
-        self.fix_shape(model_proto, param_mapping)
+        prefill_decode_models = getattr(config, "prefill_decode_models", True)
 
-        # --- Step 3: Save model as external-data format ---
-        output_model_file = Path(output_model_dir) / "model.onnx"
-        external_data_file = Path(output_model_dir) / "model.onnx.data"
+        if not prefill_decode_models:
+            # Single model mode
+            ctx_lengths_list = [int(config.context_length)]
+        else:
+            # Composite model mode → AR1 + AR-N
+            n = int(config.context_length)
+            ctx_lengths_list = [n, 1]
 
-        onnx.save(
-            model_proto,
-            str(output_model_file),
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location=external_data_file.name,
-            convert_attribute=False,
+        multiple = len(ctx_lengths_list) > 1
+
+        generated_handlers: dict[int, ONNXModelHandler] = {}
+        generated_names: dict[int, str] = {}
+
+        for ctx_len in ctx_lengths_list:
+            # --- Clone base model proto for this variant ---
+            model_proto = onnx.ModelProto()
+            model_proto.CopyFrom(base_model_proto)
+
+            # --- Step 3: Fix symbolic dimensions for this context length ---
+            param_mapping = {batch_size: config.batch_size, sequence_length: ctx_len}
+            self.fix_shape(model_proto, param_mapping)
+
+            add_version_metadata_to_model_proto(model_proto)
+
+            # --- Step 4: Save as external-data ONNX ---
+            # single model: "model", composite: "prefill" (AR-N) or "decode" (AR-1)
+            if not multiple:
+                logical_name = "model"
+            elif ctx_len == 1:
+                logical_name = "decode"
+            else:
+                logical_name = "prefill"
+            onnx_file_name = f"{logical_name}.onnx"
+            output_model_file = Path(output_model_dir) / onnx_file_name
+            # share a single external-data file.
+            external_data_file = Path(output_model_dir) / "model.onnx.data"
+
+            output_model_dir.mkdir(parents=True, exist_ok=True)
+            external_data_file.unlink(missing_ok=True)
+            onnx.save(
+                model_proto,
+                str(output_model_file),
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=external_data_file.name,
+                convert_attribute=False,
+            )
+
+            # Build handler for this static model
+            new_model_attributes = deepcopy(model.model_attributes) or {}
+            handler = ONNXModelHandler(
+                model_path=output_model_dir,
+                onnx_file_name=output_model_file.name,
+                model_attributes=new_model_attributes,
+            )
+
+            # Store handler + logical component name
+            generated_handlers[ctx_len] = handler
+            generated_names[ctx_len] = logical_name
+
+        # --- Step 5: Update genai_config.json ---
+        # For single model: pipeline with one component.
+        # For multiple models: pipeline with multiple components (composite).
+        if not multiple:
+            # Single context length
+            ctx_len = ctx_lengths_list[0]
+            handler = generated_handlers[ctx_len]
+
+            decoder_config_extra = {
+                "inputs": {
+                    "past_sequence_length": "past_seq_len",
+                    "total_sequence_length": "total_seq_len",
+                },
+                "sliding_window": {
+                    "window_size": ctx_len,
+                    "pad_value": 0,
+                    "alignment": "left",
+                    "slide_key_value_cache": False,
+                },
+            }
+
+            if not config.update_genai_config:
+                return handler
+
+            return update_llm_pipeline_genai_config_gpu(
+                model=handler,
+                output_model_dir=output_model_dir,
+                decoder_config_extra=decoder_config_extra,
+                composite_components=None,
+            )
+
+        # Multiple context lengths -> wrap in CompositeModelHandler and create composite pipeline
+        components = []
+        component_names = []
+
+        for ctx_len, handler in generated_handlers.items():
+            components.append(handler)
+            component_names.append(generated_names[ctx_len])
+
+        new_model_attributes = deepcopy(model.model_attributes) or {}
+        # prefill and decode components share a single external-data file (model.onnx.data);
+        # tell OliveCache.save_model to preserve that shared name instead of renaming it after
+        # whichever component is copied first.
+        new_model_attributes["keep_shared_external_data_names"] = True
+
+        composite = CompositeModelHandler(
+            model_components=components, model_component_names=component_names, model_attributes=new_model_attributes
         )
 
-        decoder_config_extra = {
+        if not config.update_genai_config:
+            return composite
+
+        # Build per-component sliding_window config keyed by name
+        composite_decoder_extra = {
             "inputs": {
                 "past_sequence_length": "past_seq_len",
                 "total_sequence_length": "total_seq_len",
             },
             "sliding_window": {
-                "window_size": config.context_length,
+                "window_size": max(ctx_lengths_list),
                 "pad_value": 0,
                 "alignment": "left",
                 "slide_key_value_cache": False,
             },
         }
 
-        input_model_path = model.model_path
-        model_static = ONNXModelHandler(model_path=output_model_dir, onnx_file_name=output_model_file.name)
-
         return update_llm_pipeline_genai_config_gpu(
-            model_static,
-            output_model_dir,
-            input_model_path,
-            decoder_config_extra,
+            model=composite,
+            output_model_dir=output_model_dir,
+            decoder_config_extra=composite_decoder_extra,
+            composite_components=list(zip(component_names, components)),
         )
 
     @staticmethod
@@ -244,16 +377,15 @@ class StaticLLM(Pass):
             model.
         """
         original_shapes = {}
-        dag = OnnxDAG(model_proto)
-        for output_name in dag.get_output_names():
-            original_shapes[output_name] = dag.get_io_shape(output_name)
+        for output in model_proto.graph.output:
+            original_shapes[output.name] = _proto_io_shape(model_proto, output.name)
 
         # fix dim params
-        fix_dim_params(dag.model, param_mapping.keys(), param_mapping.values())
+        fix_dim_params(model_proto, param_mapping.keys(), param_mapping.values())
 
         # update the param mapping with the new shapes
         for output_name, original_shape in original_shapes.items():
-            new_shape = dag.get_io_shape(output_name)
+            new_shape = _proto_io_shape(model_proto, output_name)
 
             for old_dim, new_dim in zip(original_shape, new_shape):
                 if isinstance(old_dim, str) and isinstance(new_dim, int):

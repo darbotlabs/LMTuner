@@ -3,6 +3,8 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 import logging
+import shutil
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -10,6 +12,7 @@ from olive.common.hf.model_io import get_model_dummy_input, get_model_io_config
 from olive.common.hf.utils import (
     get_generation_config,
     get_model_config,
+    get_processor,
     get_tokenizer,
     save_model_config,
     save_module_files,
@@ -39,7 +42,11 @@ class HfMixin:
         :param exclude_load_keys: list of keys to exclude from load_kwargs
         :return: model config
         """
-        return get_model_config(self.model_path, **self.get_load_kwargs(exclude_load_keys))
+        return get_model_config(
+            self.model_path,
+            test_model_config=getattr(self, "test_model_config", None),
+            **self.get_load_kwargs(exclude_load_keys),
+        )
 
     def get_hf_generation_config(self, exclude_load_keys: Optional[list[str]] = None) -> Optional["GenerationConfig"]:
         """Get generation config for the model if it exists.
@@ -47,13 +54,25 @@ class HfMixin:
         :param exclude_load_keys: list of keys to exclude from load_kwargs
         :return: generation config or None
         """
-        return get_generation_config(self.model_path, **self.get_load_kwargs(exclude_load_keys))
+        # Generation config loading should not receive model-loading-only kwargs such as
+        # dtype, device placement, or quantization settings.
+        generation_config_exclude_keys = {"torch_dtype", "dtype", "device_map", "max_memory", "quantization_config"}
+        if exclude_load_keys:
+            generation_config_exclude_keys.update(exclude_load_keys)
+        return get_generation_config(self.model_path, **self.get_load_kwargs(list(generation_config_exclude_keys)))
 
     def get_hf_tokenizer(self) -> Union["PreTrainedTokenizer", "PreTrainedTokenizerFast"]:
         """Get tokenizer for the model."""
         # don't provide loading args for tokenizer directly since it tries to serialize all kwargs
         # TODO(anyone): only provide relevant kwargs, no use case for now to provide kwargs
         return get_tokenizer(self.model_path)
+
+    def get_hf_processor(self, exclude_load_keys: Optional[list[str]] = None):
+        """Get processor for the model if one exists."""
+        processor_exclude_keys = {"torch_dtype", "dtype", "device_map", "max_memory", "quantization_config"}
+        if exclude_load_keys:
+            processor_exclude_keys.update(exclude_load_keys)
+        return get_processor(self.model_path, **self.get_load_kwargs(list(processor_exclude_keys)))
 
     def save_metadata(self, output_dir: str, exclude_load_keys: Optional[list[str]] = None, **kwargs) -> list[str]:
         """Save model metadata files to the output directory.
@@ -108,13 +127,93 @@ class HfMixin:
             tokenizer_filepaths = save_tokenizer(self.get_hf_tokenizer(), output_dir, **kwargs)
             saved_filepaths.extend([fp for fp in tokenizer_filepaths if Path(fp).exists()])
 
+        # save processor / image processor; per-file, don't overwrite anything that already exists
+        # (see ``_copy_missing_files``). This writes preprocessor_config.json (and any image
+        # processor files) so downstream tools that load from this output_dir (e.g. mobius's
+        # AutoProcessor.from_pretrained) get the model's real preprocessing config instead of
+        # silently falling back to defaults. Only applicable to multimodal models (e.g. VL
+        # checkpoints); text-only models have no processor and are already covered by the
+        # tokenizer save above.
+        #
+        # Note: unlike the tokenizer save above, this is not gated on a single sentinel file
+        # (e.g. "does preprocessor_config.json already exist?") -- a processor can emit several
+        # files (preprocessor_config.json, chat_template.json, ...), and an earlier step may have
+        # saved only some of them. Always calling ``_save_processor`` lets ``_copy_missing_files``
+        # fill in whichever files are still missing, file by file.
+        saved_filepaths.extend(self._save_processor(output_dir, exclude_load_keys=exclude_load_keys, **kwargs))
+
         logger.debug("Save metadata files to %s: %s", output_dir, saved_filepaths)
 
         return saved_filepaths
 
+    def _save_processor(self, output_dir: Path, exclude_load_keys: Optional[list[str]] = None, **kwargs) -> list[str]:
+        """Save the model's processor files (preprocessor_config.json, ...) to output_dir.
+
+        Never overwrites a file that already exists in ``output_dir``:
+        ``ProcessorMixin.save_pretrained`` also re-saves the processor's tokenizer, which would
+        clobber a tokenizer that an earlier step intentionally customized and saved. The
+        processor is therefore saved to a temporary directory first and only its new files are
+        copied over.
+
+        :param output_dir: output directory to save the processor files in
+        :param exclude_load_keys: list of keys to exclude from load_kwargs
+        :param kwargs: additional keyword arguments to pass to `save_pretrained` method
+        :return: list of file paths that were written
+        """
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        try:
+            processor = self.get_hf_processor(exclude_load_keys=exclude_load_keys)
+        except Exception as e:  # pylint: disable=broad-except
+            # unexpected: loading failed for a reason other than "this model has no processor"
+            # (network / auth / incompatible config). Surface it -- VL models genuinely need
+            # preprocessor_config.json downstream.
+            logger.warning("Failed to load processor for %r, no processor files saved: %s", self.model_name_or_path, e)
+            return []
+
+        if processor is None:
+            logger.debug("No processor found for %r.", self.model_name_or_path)
+            return []
+
+        if isinstance(processor, PreTrainedTokenizerBase):
+            # expected for text-only models: AutoProcessor falls back to returning the
+            # tokenizer, which the tokenizer save above already handled.
+            logger.debug("No processor for %r (AutoProcessor returned a tokenizer).", self.model_name_or_path)
+            return []
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="olive_processor_") as temp_dir:
+                processor.save_pretrained(temp_dir, **kwargs)
+                return self._copy_missing_files(Path(temp_dir), output_dir)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("Failed to save processor files for %r: %s", self.model_name_or_path, e)
+            return []
+
+    @staticmethod
+    def _copy_missing_files(src_dir: Path, output_dir: Path) -> list[str]:
+        """Copy files from src_dir into output_dir, keeping any file that already exists there."""
+        copied_filepaths = []
+        for src_path in sorted(src_dir.rglob("*")):
+            if not src_path.is_file():
+                continue
+            dst_path = output_dir / src_path.relative_to(src_dir)
+            if dst_path.exists():
+                logger.debug("Keeping existing %s instead of overwriting it.", dst_path)
+                continue
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src_path, dst_path)
+            copied_filepaths.append(str(dst_path))
+        return copied_filepaths
+
     def get_hf_io_config(self) -> Optional[dict[str, Any]]:
         """Get Io config for the model."""
-        return get_model_io_config(self.model_path, self.task, self.load_model(), **self.get_load_kwargs())
+        return get_model_io_config(
+            self.model_path,
+            self.task,
+            self.load_model(),
+            test_model_config=getattr(self, "test_model_config", None),
+            **self.get_load_kwargs(),
+        )
 
     def get_hf_dummy_inputs(self) -> Optional[dict[str, Any]]:
         """Get dummy inputs for the model."""
@@ -122,6 +221,7 @@ class HfMixin:
             self.model_path,
             self.task,
             model=self.load_model(),
+            test_model_config=getattr(self, "test_model_config", None),
             **self.get_load_kwargs(),
         )
 
