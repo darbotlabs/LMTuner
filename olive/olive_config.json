@@ -577,7 +577,7 @@
             "supported_providers": [ "*" ],
             "supported_accelerators": [ "gpu" ],
             "supported_precisions": [ "*" ],
-            "extra_dependencies": [ "sd-lora" ],
+            "extra_dependencies": [ "diffusers" ],
             "supported_algorithms": [  ],
             "supported_quantization_encodings": [  ],
             "thread_safe": false,
@@ -783,6 +783,8 @@
         "inc": [ "neural-compressor" ],
         "lora": [ "accelerate>=0.30.0", "peft", "scipy" ],
         "diffusers": [ "accelerate>=0.30.0", "peft", "diffusers" ],
+        "acp": [ "hypercorn", "agent-client-protocol[http]" ],
+        "mcp": [ "hypercorn" ],
         "nvmo": [ "nvidia-modelopt[onnx]" ],
         "openvino": [
             "openvino>=2025.4.1",

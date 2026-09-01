@@ -27,7 +27,7 @@ class DiffusionLoraCommand(BaseOliveCLICommand):
     def register_subcommand(parser: ArgumentParser):
         sub_parser = parser.add_parser(
             "diffusion-lora",
-            help="Train LoRA adapters for diffusion models (SD 1.5, SDXL, Flux).",
+            help="Train LoRA adapters for diffusion models (SD, SDXL, SD3, Flux, Sana).",
         )
 
         # Model options
@@ -52,7 +52,7 @@ class DiffusionLoraCommand(BaseOliveCLICommand):
             type=str,
             default=DiffusersModelVariant.AUTO,
             choices=[t.value for t in DiffusersModelVariant],
-            help="Type of diffusion model. Default: auto-detect.",
+            help="Type of diffusion model: auto|sd|sdxl|sd3|flux|sana (not sd15). Default: auto.",
         )
 
         # LoRA options
@@ -80,7 +80,28 @@ class DiffusionLoraCommand(BaseOliveCLICommand):
             "--target_modules",
             type=str,
             default=None,
-            help="Target modules for LoRA (comma-separated). Default: auto-detect based on model type.",
+            help="Target modules for LoRA (comma-separated). Default: auto-detect. Pass 'all-linear' to target every linear layer.",
+        )
+        lora_group.add_argument(
+            "--use_dora",
+            action="store_true",
+            help="Opt-in PEFT DoRA. Default off (current Olive LoRA).",
+        )
+        lora_group.add_argument(
+            "--use_rslora",
+            action="store_true",
+            help="Opt-in PEFT RSLoRA. Default off (current Olive LoRA).",
+        )
+        lora_group.add_argument(
+            "--init_lora_weights",
+            type=str,
+            default="gaussian",
+            help="PEFT init_lora_weights. Default gaussian (current Olive LoRA). Use pissa for PiSSA.",
+        )
+        lora_group.add_argument(
+            "--trust_remote_code",
+            action="store_true",
+            help="Allow custom HF code when loading the diffusion model. Default False.",
         )
 
         # DreamBooth options
@@ -301,6 +322,10 @@ class DiffusionLoraCommand(BaseOliveCLICommand):
             ((*pass_key, "r"), self.args.lora_r),
             ((*pass_key, "alpha"), self.args.alpha),
             ((*pass_key, "lora_dropout"), self.args.lora_dropout),
+            ((*pass_key, "use_dora"), self.args.use_dora),
+            ((*pass_key, "use_rslora"), self.args.use_rslora),
+            ((*pass_key, "init_lora_weights"), self.args.init_lora_weights),
+            ((*pass_key, "trust_remote_code"), self.args.trust_remote_code),
             ((*pass_key, "dreambooth"), self.args.dreambooth),
             ((*pass_key, "instance_prompt"), self.args.instance_prompt),
             ((*pass_key, "with_prior_preservation"), self.args.with_prior_preservation),
@@ -329,7 +354,9 @@ class DiffusionLoraCommand(BaseOliveCLICommand):
         ]
 
         if self.args.target_modules:
-            to_replace.append(((*pass_key, "target_modules"), self.args.target_modules.split(",")))
+            raw = self.args.target_modules.strip()
+            modules = ["all-linear"] if raw == "all-linear" else [m.strip() for m in raw.split(",") if m.strip()]
+            to_replace.append(((*pass_key, "target_modules"), modules))
 
         for keys, value in to_replace:
             if value is not None:

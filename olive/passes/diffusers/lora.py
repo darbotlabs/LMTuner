@@ -78,6 +78,48 @@ class DiffusionTrainingArguments:
         self.guidance_scale = guidance_scale
 
 
+
+ALL_LINEAR = "all-linear"
+
+
+def resolve_target_modules(target_modules, default_modules):
+    """Return PEFT target_modules, mapping the opt-in all-linear sentinel to the PEFT string."""
+    if target_modules is None:
+        return default_modules
+    if target_modules == ALL_LINEAR or target_modules == [ALL_LINEAR]:
+        return ALL_LINEAR
+    return target_modules
+
+
+def pretrained_kwargs(config) -> dict:
+    """Keyword args for from_pretrained. trust_remote_code defaults to False."""
+    return {"trust_remote_code": bool(getattr(config, "trust_remote_code", False))}
+
+
+def peft_lora_kwargs(config, default_target_modules) -> dict:
+    """Keyword args for PEFT LoraConfig. Defaults match current Olive LoRA."""
+    init_weights = getattr(config, "init_lora_weights", None) or "gaussian"
+    kwargs = {
+        "r": config.r,
+        "lora_alpha": config.alpha if config.alpha is not None else config.r,
+        "lora_dropout": config.lora_dropout,
+        "init_lora_weights": init_weights,
+        "target_modules": resolve_target_modules(config.target_modules, default_target_modules),
+    }
+    if getattr(config, "use_dora", False):
+        kwargs["use_dora"] = True
+    if getattr(config, "use_rslora", False):
+        kwargs["use_rslora"] = True
+    return kwargs
+
+
+def build_peft_lora_config(config, default_target_modules):
+    """Build a PEFT LoraConfig. Defaults match current Olive LoRA; DoRA/RSLoRA/PiSSA/all-linear are opt-in."""
+    from peft import LoraConfig
+
+    return LoraConfig(**peft_lora_kwargs(config, default_target_modules))
+
+
 class SDLoRA(Pass):
     """Run LoRA fine-tuning on diffusion models.
 
@@ -96,7 +138,7 @@ class SDLoRA(Pass):
             "model_variant": PassConfigParam(
                 type_=DiffusersModelVariant,
                 default_value=DiffusersModelVariant.AUTO,
-                description="Model variant: 'sd15', 'sdxl', 'flux', or 'auto' to detect automatically.",
+                description="Model variant: auto|sd|sdxl|sd3|flux|sana (not sd15). Default auto.",
             ),
             # LoRA config
             "r": PassConfigParam(
@@ -120,8 +162,32 @@ class SDLoRA(Pass):
                 description=(
                     "Target modules for LoRA. Defaults depend on model variant:\n"
                     "- SD/SDXL: ['to_k', 'to_q', 'to_v', 'to_out.0']\n"
-                    "- Flux: ['to_k', 'to_q', 'to_v', 'to_out.0', 'add_k_proj', 'add_q_proj', 'add_v_proj']"
+                    "- Flux: ['to_k', 'to_q', 'to_v', 'to_out.0', 'add_k_proj', 'add_q_proj', 'add_v_proj']\n"
+                    "Pass ['all-linear'] to target every linear layer (opt-in PEFT)."
                 ),
+            ),
+            "use_dora": PassConfigParam(
+                type_=bool,
+                default_value=False,
+                description="Opt-in PEFT DoRA. Default False keeps current Olive LoRA.",
+            ),
+            "use_rslora": PassConfigParam(
+                type_=bool,
+                default_value=False,
+                description="Opt-in PEFT RSLoRA. Default False keeps current Olive LoRA.",
+            ),
+            "init_lora_weights": PassConfigParam(
+                type_=str,
+                default_value="gaussian",
+                description=(
+                    "PEFT init_lora_weights. Default 'gaussian' (current Olive LoRA). "
+                    "Set to 'pissa' for PiSSA initialization."
+                ),
+            ),
+            "trust_remote_code": PassConfigParam(
+                type_=bool,
+                default_value=False,
+                description="Forwarded to from_pretrained. Default False.",
             ),
             # Data config
             "train_data_config": PassConfigParam(
@@ -244,7 +310,6 @@ class SDLoRA(Pass):
         from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
         from diffusers.optimization import get_scheduler
         from diffusers.training_utils import compute_snr
-        from peft import LoraConfig
         from tqdm.auto import tqdm
         from transformers import CLIPTextModel, CLIPTextModelWithProjection
 
@@ -268,17 +333,17 @@ class SDLoRA(Pass):
             logger.info("Loading SD models from %s", model_path)
 
             # Load text encoders (frozen, for encoding prompts only)
-            text_encoder = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder")
+            text_encoder = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", **pretrained_kwargs(config))
             text_encoder_2 = None
             if model_variant == DiffusersModelVariant.SDXL:
-                text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2")
+                text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", **pretrained_kwargs(config))
 
             # Load VAE and UNet
-            vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae")
-            unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet")
+            vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", **pretrained_kwargs(config))
+            unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", **pretrained_kwargs(config))
 
             # Load noise scheduler
-            noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
+            noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler", **pretrained_kwargs(config))
 
             # Set weight dtype
             weight_dtype = torch.float32
@@ -302,15 +367,8 @@ class SDLoRA(Pass):
             unet.to(accelerator.device, dtype=weight_dtype)
 
             # Setup LoRA for UNet only (after moving to device)
-            lora_alpha = config.alpha if config.alpha is not None else config.r
-            target_modules = config.target_modules or ["to_k", "to_q", "to_v", "to_out.0"]
-
-            unet_lora_config = LoraConfig(
-                r=config.r,
-                lora_alpha=lora_alpha,
-                lora_dropout=config.lora_dropout,
-                init_lora_weights="gaussian",
-                target_modules=target_modules,
+            unet_lora_config = build_peft_lora_config(
+                config, ["to_k", "to_q", "to_v", "to_out.0"]
             )
             unet.add_adapter(unet_lora_config)
 
@@ -342,6 +400,7 @@ class SDLoRA(Pass):
                     class_data_dir=config.class_data_dir,
                     num_class_images=config.num_class_images,
                     model_variant=model_variant,
+                    trust_remote_code=config.trust_remote_code,
                 )
 
             # Load dataset
@@ -355,6 +414,7 @@ class SDLoRA(Pass):
                 class_data_dir=class_data_dir,
                 class_prompt=config.class_prompt,
                 instance_prompt=config.instance_prompt,
+                trust_remote_code=config.trust_remote_code,
             )
 
             # Calculate training steps
@@ -599,7 +659,6 @@ class SDLoRA(Pass):
         from accelerate.utils import ProjectConfiguration, set_seed
         from diffusers import AutoencoderKL, FluxTransformer2DModel
         from diffusers.optimization import get_scheduler
-        from peft import LoraConfig
         from tqdm.auto import tqdm
         from transformers import CLIPTextModel, T5EncoderModel
 
@@ -629,12 +688,12 @@ class SDLoRA(Pass):
             weight_dtype = torch.bfloat16
 
             # Load text encoders (frozen, for encoding prompts only)
-            text_encoder = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder")
-            text_encoder_2 = T5EncoderModel.from_pretrained(model_path, subfolder="text_encoder_2")
+            text_encoder = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", **pretrained_kwargs(config))
+            text_encoder_2 = T5EncoderModel.from_pretrained(model_path, subfolder="text_encoder_2", **pretrained_kwargs(config))
 
             # Load VAE and Transformer
-            vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae")
-            transformer = FluxTransformer2DModel.from_pretrained(model_path, subfolder="transformer")
+            vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", **pretrained_kwargs(config))
+            transformer = FluxTransformer2DModel.from_pretrained(model_path, subfolder="transformer", **pretrained_kwargs(config))
 
             # Freeze all base models and move to device
             vae.requires_grad_(False)
@@ -650,24 +709,18 @@ class SDLoRA(Pass):
             transformer.to(accelerator.device, dtype=weight_dtype)
 
             # Setup LoRA for transformer only (after moving to device)
-            lora_alpha = config.alpha if config.alpha is not None else config.r
-            target_modules = config.target_modules or [
-                "to_k",
-                "to_q",
-                "to_v",
-                "to_out.0",
-                "add_k_proj",
-                "add_q_proj",
-                "add_v_proj",
-                "to_add_out",
-            ]
-
-            transformer_lora_config = LoraConfig(
-                r=config.r,
-                lora_alpha=lora_alpha,
-                lora_dropout=config.lora_dropout,
-                init_lora_weights="gaussian",
-                target_modules=target_modules,
+            transformer_lora_config = build_peft_lora_config(
+                config,
+                [
+                    "to_k",
+                    "to_q",
+                    "to_v",
+                    "to_out.0",
+                    "add_k_proj",
+                    "add_q_proj",
+                    "add_v_proj",
+                    "to_add_out",
+                ],
             )
             transformer.add_adapter(transformer_lora_config)
 
@@ -699,6 +752,7 @@ class SDLoRA(Pass):
                     class_data_dir=config.class_data_dir,
                     num_class_images=config.num_class_images,
                     model_variant=DiffusersModelVariant.FLUX,
+                    trust_remote_code=config.trust_remote_code,
                 )
 
             # Load dataset
@@ -712,6 +766,7 @@ class SDLoRA(Pass):
                 class_data_dir=class_data_dir,
                 class_prompt=config.class_prompt,
                 instance_prompt=config.instance_prompt,
+                trust_remote_code=config.trust_remote_code,
             )
 
             # Calculate training steps
@@ -916,6 +971,7 @@ class SDLoRA(Pass):
         class_data_dir: Optional[str],
         num_class_images: int,
         model_variant: "DiffusersModelVariant",
+        trust_remote_code: bool = False,
     ) -> Path:
         """Generate class images for prior preservation if needed.
 
@@ -925,6 +981,7 @@ class SDLoRA(Pass):
             class_data_dir: Directory to store class images. If None, uses Olive cache.
             num_class_images: Target number of class images.
             model_variant: Type of diffusion model.
+            trust_remote_code: Forwarded to from_pretrained. Default False.
 
         Returns:
             Path to directory containing class images.
@@ -963,11 +1020,11 @@ class SDLoRA(Pass):
         if model_variant == DiffusersModelVariant.FLUX:
             from diffusers import FluxPipeline
 
-            pipeline = FluxPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+            pipeline = FluxPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
         elif model_variant == DiffusersModelVariant.SDXL:
             from diffusers import StableDiffusionXLPipeline
 
-            pipeline = StableDiffusionXLPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
+            pipeline = StableDiffusionXLPipeline.from_pretrained(model_path, torch_dtype=torch.float16, trust_remote_code=trust_remote_code)
         else:
             from diffusers import StableDiffusionPipeline
 
@@ -976,6 +1033,7 @@ class SDLoRA(Pass):
                 torch_dtype=torch.float16,
                 safety_checker=None,
                 requires_safety_checker=False,
+                trust_remote_code=trust_remote_code,
             )
 
         pipeline = pipeline.to("cuda")
@@ -1024,6 +1082,7 @@ class SDLoRA(Pass):
         class_data_dir=None,
         class_prompt=None,
         instance_prompt=None,
+        trust_remote_code=False,
     ):
         """Create training dataloader with image loading and tokenization.
 
@@ -1036,6 +1095,7 @@ class SDLoRA(Pass):
             class_data_dir: Directory containing class images (for prior preservation).
             class_prompt: Prompt for class images (for prior preservation).
             instance_prompt: Fixed prompt for all instance images (for DreamBooth).
+            trust_remote_code: Forwarded to tokenizer from_pretrained. Default False.
 
         Raises:
             ValueError: If dataset has not been preprocessed with aspect_ratio_bucketing or image_resizing.
@@ -1058,13 +1118,13 @@ class SDLoRA(Pass):
         # Load tokenizers based on model variant
         tokenizers = {}
         if model_variant == DiffusersModelVariant.FLUX:
-            tokenizers["clip"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
-            tokenizers["t5"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2")
+            tokenizers["clip"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", trust_remote_code=trust_remote_code)
+            tokenizers["t5"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", trust_remote_code=trust_remote_code)
         elif model_variant == DiffusersModelVariant.SDXL:
-            tokenizers["one"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
-            tokenizers["two"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2")
+            tokenizers["one"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", trust_remote_code=trust_remote_code)
+            tokenizers["two"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", trust_remote_code=trust_remote_code)
         else:  # SD
-            tokenizers["main"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+            tokenizers["main"] = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", trust_remote_code=trust_remote_code)
 
         def process_image(image_path):
             """Load and process a single image.
