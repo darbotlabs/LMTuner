@@ -41,6 +41,9 @@ include_patterns = [
   '**/*.py',
   '**/*.pyi'
 ]
+exclude_patterns = [
+  'harness/**',
+]
 command = [
   'python',
   '-m',
@@ -67,6 +70,7 @@ include_patterns = [
   '**/*.py'
 ]
 exclude_patterns = [
+  'harness/**',
   '**/hadamard_utils.py'
 ]
 command = [
@@ -95,6 +99,7 @@ include_patterns = [
   '**/*.py'
 ]
 exclude_patterns = [
+  'harness/**',
   '**/hadamard_utils.py'
 ]
 command = [
@@ -120,6 +125,9 @@ init_command = [
 [[linter]]
 code = 'NOQA'
 include_patterns = ['**/*.py', '**/*.pyi']
+exclude_patterns = [
+  'harness/**',
+]
 command = [
   'python',
   '-m',
@@ -141,6 +149,7 @@ command = [
 code = 'SPACES'
 include_patterns = ['**']
 exclude_patterns = [
+  'harness/**',
   '**/*.json'
 ]
 command = [
@@ -164,6 +173,7 @@ command = [
 code = 'TABS'
 include_patterns = ['**']
 exclude_patterns = [
+  'harness/**',
   '.lintrunner.toml',
   '**/Makefile',
   '**/*.bat',
@@ -191,7 +201,9 @@ command = [
 code = 'TOML-SORT'
 is_formatter = true
 include_patterns = ['**/*.toml']
-exclude_patterns = []
+exclude_patterns = [
+  'harness/**',
+]
 command = [
   'python',
   '-m',
@@ -214,6 +226,7 @@ init_command = [
 code = 'EDITORCONFIG-CHECKER'
 include_patterns = ['**']
 exclude_patterns = [
+  'harness/**',
   '**/*.ipynb',
   '**/*.json',
   '**/Makefile'
@@ -241,7 +254,9 @@ init_command = [
 code = 'REQUIREMENTS-TXT'
 is_formatter = true
 include_patterns = ['**/requirements*.txt']
-exclude_patterns = []
+exclude_patterns = [
+  'harness/**',
+]
 command = [
   'python',
   '-m',
@@ -256,7 +271,9 @@ command = [
 code = "FORMAT-JSON"
 is_formatter = true
 include_patterns = ['**/*.json']
-exclude_patterns = []
+exclude_patterns = [
+  'harness/**',
+]
 command = [
   'python',
   'scripts/format_json.py',

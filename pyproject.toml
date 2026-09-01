@@ -81,6 +81,7 @@ markers = [
 
 [tool.ruff]
 line-length = 120
+extend-exclude = ["harness"]
 target-version = "py39"
 
 [tool.ruff.lint]
