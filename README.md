@@ -91,6 +91,19 @@ The sample chat app to run is found as [model-chat.py](https://github.com/micros
 - [LMTuner spec (install, workflow, command map)](docs/LMTUNER_SPEC.md)
 - [Harness: OptiGuide + Foundry Local](harness/README.md)
 
+
+## Agent protocols
+
+Serve LMTuner over ACP, MCP 2.0 (2026-07-28), and Microsoft 365 Activity Protocol. Full commands and spec URLs: [docs/LMTUNER_SPEC.md](docs/LMTUNER_SPEC.md#agent-protocols-acp-mcp-20-activity).
+
+```bash
+lmcli acp --transport http --port 8000     # POST/GET/DELETE /acp  (HTTP/2)
+lmcli mcp --transport http --port 8765     # POST /mcp (stateless, no session)
+lmcli copilot activity serve --port 3978   # Activity JSON on /activity
+```
+
+Diffusion LoRA PEFT flags (opt-in; defaults stay current Olive LoRA): `--use_dora`, `--use_rslora`, `--init_lora_weights pissa`, `--target_modules all-linear`. Model variant is `--model_variant auto|sd|sdxl|sd3|flux|sana` (not `sd15`).
+
 ## GitHub Copilot Integration
 
 LMTuner includes native GitHub Copilot integration for AI-assisted model optimization:

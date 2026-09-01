@@ -6,6 +6,7 @@ import sys
 from argparse import ArgumentParser
 from warnings import warn
 
+from olive.cli.acp import AcpCommand
 from olive.cli.auto_opt import AutoOptCommand
 from olive.cli.benchmark import BenchmarkCommand
 from olive.cli.capture_onnx import CaptureOnnxGraphCommand
@@ -18,6 +19,7 @@ from olive.cli.finetune import FineTuneCommand
 from olive.cli.generate_adapter import GenerateAdapterCommand
 from olive.cli.generate_cost_model import GenerateCostModelCommand
 from olive.cli.init import InitCommand
+from olive.cli.mcp import McpCommand
 from olive.cli.model_package import ModelPackageCommand
 from olive.cli.optimize import OptimizeCommand
 from olive.cli.quantize import QuantizeCommand
@@ -34,7 +36,18 @@ def get_cli_parser(called_as_console_script: bool = True) -> ArgumentParser:
     :param called_as_console_script: Whether the script was called as a console script.
     :return: The CLI parser.
     """
-    parser = ArgumentParser("LMTuner CLI tool", usage="lmcli" if called_as_console_script else "python -m olive")
+    parser = ArgumentParser(
+        "LMTuner CLI tool",
+        usage="lmcli" if called_as_console_script else "python -m olive",
+        description=(
+            "LMTuner command suite: init, run, auto-opt, optimize, finetune, diffusion-lora, "
+            "capture-onnx-graph, benchmark, acp, mcp, and copilot (GitHub helpers + activity serve)."
+        ),
+        epilog=(
+            "Protocols: lmcli acp [--transport stdio|http] | lmcli mcp [--transport stdio|http] | "
+            "lmcli copilot activity serve. See docs/LMTUNER_SPEC.md."
+        ),
+    )
     commands_parser = parser.add_subparsers()
 
     # Register commands
@@ -59,6 +72,8 @@ def get_cli_parser(called_as_console_script: bool = True) -> ArgumentParser:
     ModelPackageCommand.register_subcommand(commands_parser)
     BenchmarkCommand.register_subcommand(commands_parser)
     CopilotCommand.register_subcommand(commands_parser)
+    AcpCommand.register_subcommand(commands_parser)
+    McpCommand.register_subcommand(commands_parser)
 
     return parser
 

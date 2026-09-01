@@ -144,7 +144,75 @@ lmcli diffusion-lora -m stabilityai/stable-diffusion-xl-base-1.0 -d ./train_imag
 lmcli diffusion-lora -m black-forest-labs/FLUX.1-dev -d ./train_images -r 32
 ```
 
-Useful flags: `-o/--output_path` (default `diffusion-lora-adapter`), `--model_variant auto|sd15|sdxl|flux`, `-r/--lora_r`, `--max_train_steps`, `--mixed_precision bf16`.
+Useful flags: `-o/--output_path` (default `diffusion-lora-adapter`), `--model_variant auto|sd|sdxl|sd3|flux|sana` (not `sd15`), `-r/--lora_r`, `--max_train_steps`, `--mixed_precision bf16`.
+
+Opt-in PEFT flags (defaults remain current Olive LoRA — gaussian init, attention-projection target modules, DoRA/RSLoRA off, `trust_remote_code=False`):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--use_dora` | off | PEFT DoRA |
+| `--use_rslora` | off | PEFT RSLoRA |
+| `--init_lora_weights gaussian or pissa` | `gaussian` | Set `pissa` for PiSSA init |
+| `--target_modules all-linear` | auto (attn projections) | Target every linear layer |
+| `--trust_remote_code` | off | Forwarded to `from_pretrained` |
+
+Install extras with `pip install -e ".[diffusers]"` (the SDLoRA pass extra_dependencies key is `diffusers`, not `sd-lora`).
+
+
+
+
+## Agent protocols (ACP, MCP 2.0, Activity)
+
+LMTuner exposes the real tuner CLI (`optimize`, `auto-opt`, `finetune`, `diffusion-lora`, `capture-onnx-graph`, `run`, `benchmark`) over three protocols. Spec URLs are the source of truth — this tree does not invent dialects.
+
+### ACP — Zed Agent Client Protocol
+
+- Spec: https://agentclientprotocol.com
+- Streamable HTTP/WS RFD: https://agentclientprotocol.com/rfds/streamable-http-websocket-transport
+- Python SDK: https://agentclientprotocol.github.io/python-sdk/web-transport/
+
+```bash
+# stdio JSON-RPC (initialize, session/new, session/prompt, session/cancel, session/close)
+lmcli acp
+
+# Streamable HTTP + WebSocket on /acp (HTTP/2 via Hypercorn — not uvicorn)
+pip install -e ".[acp]"
+lmcli acp --transport http --host 127.0.0.1 --port 8000
+```
+
+Wire rules: `POST /acp` `initialize` returns **200** with `Acp-Connection-Id`; other POSTs return **202**; `GET /acp` opens connection-scoped SSE (`Acp-Connection-Id`) or session-scoped SSE (`Acp-Connection-Id` + `Acp-Session-Id`); `DELETE /acp` ends the connection. Prefer the official SDK extra when present; otherwise LMTuner's built-in ASGI adapter implements the RFD.
+
+### MCP 2.0 — 2026-07-28 stateless Streamable HTTP
+
+- Spec: https://modelcontextprotocol.io/specification/2026-07-28
+- Transport: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+- Blog: https://blog.modelcontextprotocol.io/posts/2026-07-28/
+- Tasks extension: https://modelcontextprotocol.io/extensions/tasks/overview
+
+```bash
+lmcli mcp                          # stdio
+pip install -e ".[mcp]"
+lmcli mcp --transport http --host 127.0.0.1 --port 8765
+```
+
+Single endpoint `POST /mcp`. Every request is self-contained. Headers: `MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, and `Mcp-Name` for `tools/call`. Body `_meta` carries `io.modelcontextprotocol/protocolVersion`, `clientInfo`, and `clientCapabilities`. **No** initialize handshake and **no** `Mcp-Session-Id` (ignored if sent). Optional `server/discover`. Long-running tools return MCP Tasks (`resultType: "task"`) when the client advertises `io.modelcontextprotocol/tasks`.
+
+The older `mcp/` tree is upstream Olive's FastMCP stdio helper; `lmcli mcp` is the 2026-07-28 implementation.
+
+### Activity Protocol — Microsoft 365 Agents SDK
+
+- Spec: https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/activity-protocol
+- Schema: https://github.com/microsoft/Agents/blob/main/specs/activity/protocol-activity.md
+
+This is **not** IBM Agent Commerce Protocol and not A2A.
+
+```bash
+lmcli copilot activity serve --host 127.0.0.1 --port 3978
+lmcli copilot activity emit --type typing
+lmcli copilot activity emit --type invoke --name optimize --value-json "{\"model_name_or_path\":\"Qwen/Qwen2.5-0.5B-Instruct\",\"_dry_run\":true}"
+```
+
+POST Activity JSON to `/activity` or `/api/messages`. Types: `message`, `typing`, `invoke`, `event`, `conversationUpdate`. Invoke names map to tuner operations (`optimize`, `finetune`, `diffusion-lora`, ...). Existing `lmcli copilot --info|--suggest|--best-practices|--example` helpers are unchanged.
 
 ## Foundry Local inference
 
@@ -219,7 +287,9 @@ Launcher: `olive/cli/launcher.py`. Usage: `lmcli <command> ...` or `python -m ol
 | `auto-opt` | Automatic optimizer |
 | `optimize` | Comprehensive pass scheduling (quickstart) |
 | `capture-onnx-graph` | Export HF/PyTorch model to ONNX |
-| `diffusion-lora` | Train LoRA for SD 1.5 / SDXL / Flux |
+| `diffusion-lora` | Train LoRA for SD / SDXL / SD3 / Flux / Sana |
+| `acp` | Zed Agent Client Protocol (stdio or Streamable HTTP/WS on `/acp`) |
+| `mcp` | MCP 2.0 2026-07-28 (stdio or stateless Streamable HTTP on `/mcp`) |
 | `finetune` | PEFT fine-tune |
 | `generate-adapter` | ONNX model with adapters as inputs |
 | `convert-adapters` | Convert adapters |
@@ -231,7 +301,7 @@ Launcher: `olive/cli/launcher.py`. Usage: `lmcli <command> ...` or `python -m ol
 | `extract-adapters` | Extract adapters |
 | `generate-model-package` | Package a model |
 | `benchmark` | Evaluate with lm-eval |
-| `copilot` | LMTuner Copilot helpers (`--info`, `--suggest`, `--best-practices`, `--example`) |
+| `copilot` | GitHub Copilot helpers (`--info`, `--suggest`, `--best-practices`, `--example`) plus `activity serve` / `activity emit` |
 
 ```bash
 lmcli --help
@@ -239,6 +309,9 @@ lmcli optimize --help
 lmcli copilot --info
 lmcli copilot --suggest qwen
 lmcli copilot --example optimize
+lmcli acp --help
+lmcli mcp --help
+lmcli copilot activity --help
 ```
 
 ## End-to-end workflow

@@ -18,7 +18,7 @@ class CopilotCommand(BaseOliveCLICommand):
     def register_subcommand(parser):
         sub_parser = parser.add_parser(
             "copilot",
-            help="GitHub Copilot integration and AI assistance for LMTuner optimization",
+            help="GitHub Copilot helpers plus Microsoft 365 Activity Protocol serve/emit",
         )
         sub_parser.add_argument(
             "--info",
@@ -44,10 +44,35 @@ class CopilotCommand(BaseOliveCLICommand):
             help="Show example usage for a specific command",
         )
         add_telemetry_options(sub_parser)
+
+        # Nested: lmcli copilot activity serve | emit
+        copilot_subs = sub_parser.add_subparsers(dest="copilot_cmd")
+        activity_parser = copilot_subs.add_parser(
+            "activity",
+            help="Microsoft 365 Agents SDK Activity Protocol (not IBM ACP, not A2A)",
+        )
+        activity_subs = activity_parser.add_subparsers(dest="activity_cmd")
+        serve_parser = activity_subs.add_parser("serve", help="Serve Activity JSON on /activity and /api/messages")
+        serve_parser.add_argument("--host", default="127.0.0.1")
+        serve_parser.add_argument("--port", type=int, default=3978)
+        emit_parser = activity_subs.add_parser("emit", help="Print a sample Activity JSON to stdout")
+        emit_parser.add_argument(
+            "--type",
+            dest="activity_type",
+            default="message",
+            choices=["message", "typing", "invoke", "event", "conversationUpdate"],
+        )
+        emit_parser.add_argument("--text", default="hello from lmcli copilot")
+        emit_parser.add_argument("--name", default="optimize", help="invoke/event name (tuner operation)")
+        emit_parser.add_argument("--value-json", default=None, help="JSON object for invoke value")
+
         sub_parser.set_defaults(func=CopilotCommand)
 
     def run(self):
         """Execute the copilot command."""
+        if getattr(self.args, "copilot_cmd", None) == "activity":
+            self._run_activity()
+            return
         if self.args.info:
             self._show_info()
         elif self.args.suggest:
@@ -65,6 +90,8 @@ class CopilotCommand(BaseOliveCLICommand):
             print("  lmcli copilot --suggest llama     # Get optimization suggestions")
             print("  lmcli copilot --best-practices    # View best practices")
             print("  lmcli copilot --example optimize  # Show command examples")
+            print("  lmcli copilot activity serve      # Microsoft 365 Activity Protocol")
+            print("  lmcli acp / lmcli mcp             # ACP and MCP 2.0 servers")
 
     def _show_info(self):
         """Display information about LMTuner and GitHub Copilot integration."""
@@ -311,6 +338,37 @@ lmcli capture-onnx-graph \\
         }
 
         print(examples.get(command, "No example available for this command."))
+
+
+    def _run_activity(self):
+        """Serve or emit Microsoft 365 Activity Protocol activities."""
+        from olive.protocols import ACTIVITY_SCHEMA_URL, ACTIVITY_SPEC_URL
+        from olive.protocols.activity import invoke_activity, make_activity, serve_activity
+
+        cmd = getattr(self.args, "activity_cmd", None)
+        if cmd == "serve":
+            print("LMTuner copilot Activity Protocol server")
+            print(f"  spec: {ACTIVITY_SPEC_URL}")
+            print(f"  schema: {ACTIVITY_SCHEMA_URL}")
+            print(f"  POST http://{self.args.host}:{self.args.port}/activity")
+            print(f"  POST http://{self.args.host}:{self.args.port}/api/messages")
+            serve_activity(self.args.host, self.args.port)
+            return
+        if cmd == "emit":
+            import json
+
+            act_type = getattr(self.args, "activity_type", "message")
+            if act_type == "invoke":
+                value = {}
+                if getattr(self.args, "value_json", None):
+                    value = json.loads(self.args.value_json)
+                activity = invoke_activity(self.args.name, value)
+            else:
+                activity = make_activity(act_type, text=self.args.text, name=self.args.name if act_type == "event" else None)
+            print(json.dumps(activity, indent=2))
+            return
+        print("Usage: lmcli copilot activity serve|emit")
+        print(f"  spec: {ACTIVITY_SPEC_URL}")
 
     def _get_version(self):
         """Get the LMTuner version."""
