@@ -26,6 +26,8 @@ from olive.cli.launcher import main as cli_main
         "auto-opt",
         "optimize",
         "diffusion-lora",
+        "acp",
+        "mcp",
     ],
 )
 def test_valid_command(console_script, command):
