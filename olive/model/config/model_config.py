@@ -58,21 +58,26 @@ class ModelConfig(NestedConfig):
             names = list(self.config.get("model_component_names") or [])
             if names:
                 return names
-            return [name for name, _ in self._discover_composite_components()]
+            discovered = self._discover_composite_config()
+            return list(discovered.get("model_component_names") or []) if discovered else []
         if self.type == "hfmodel":
             return self._get_hf_components() or None
         if self.type == "diffusersmodel":
             return self._get_diffusers_components() or None
         return None
 
-    def _discover_composite_components(self) -> list[tuple[str, str]]:
-        """Discover ``(name, onnx_relpath)`` from a directory-based composite, or empty list."""
+    def _discover_composite_config(self) -> Optional[dict]:
+        """Load the complete config of a directory-based composite, if available."""
         from olive.model.utils.onnx_utils import discover_onnx_components
 
         model_path = self.config.get("model_path")
         if not model_path or not Path(str(model_path)).is_dir():
-            return []
-        return discover_onnx_components(str(model_path))
+            return None
+        if not (Path(str(model_path)) / "model_config.json").is_file() and not discover_onnx_components(
+            str(model_path)
+        ):
+            return None
+        return self.create_model().to_json()["config"]
 
     def _get_hf_components(self) -> list[str]:
         """Return component names for an HfModel by querying Mobius."""
@@ -128,18 +133,13 @@ class ModelConfig(NestedConfig):
         component_names = list(self.config.get("model_component_names") or [])
         model_components = list(self.config.get("model_components") or [])
         if not component_names:
-            discovered = self._discover_composite_components()
-            if not discovered:
+            discovered = self._discover_composite_config()
+            if not discovered or not discovered.get("model_component_names"):
                 raise ValueError(
                     "CompositeModel config has no model_components and model_path is not a directory of "
                     "per-component ONNX subfolders."
                 )
-            component_names = [name for name, _ in discovered]
-            model_path = self.config.get("model_path")
-            model_components = [
-                {"type": "ONNXModel", "config": {"model_path": str(model_path), "onnx_file_name": onnx_rel}}
-                for _, onnx_rel in discovered
-            ]
+            return ModelConfig(type=self.type, config=discovered).select_components(names)
         if len(component_names) != len(model_components):
             raise ValueError("CompositeModel config has mismatched model_components and model_component_names lengths.")
         missing = [n for n in names if n not in component_names]
@@ -170,13 +170,9 @@ class ModelConfig(NestedConfig):
         return ModelConfig(type=self.type, config=new_config)
 
     def _select_hf_component(self, names: list[str]) -> "ModelConfig":
-        """Select one HfModel component for component-scoped PyTorch optimization."""
+        """Select HfModel components for component-scoped PyTorch optimization."""
         if not names:
             raise ValueError("select_components requires a non-empty list of names.")
-        if len(names) != 1:
-            raise ValueError(
-                f"HfModel components must be optimized one at a time; got {names}. Use a separate build per component."
-            )
 
         from olive.common.mobius_utils import inspect_components
 
@@ -192,20 +188,47 @@ class ModelConfig(NestedConfig):
         missing = [name for name in names if name not in components_by_name]
         if missing:
             raise ValueError(f"Unknown component name(s) {missing}. Available components: {list(components_by_name)}.")
-        component = components_by_name[names[0]]
-        if not component.source_paths and len(components) > 1:
+        selected_components = [components_by_name[name] for name in names]
+        missing_paths = [component.name for component in selected_components if not component.source_paths]
+        if missing_paths and len(components) > 1:
             raise ValueError(
-                f"Component {component.name!r} has no runtime source paths, so Olive cannot safely "
+                f"Component(s) {missing_paths} have no runtime source paths, so Olive cannot safely "
                 "scope PyTorch passes to it."
             )
 
         new_config = deepcopy(self.config)
         attributes = dict(new_config.get("model_attributes") or {})
-        attributes["component_name"] = component.name
-        if component.role is not None:
-            attributes["component_role"] = component.role
-        if component.source_paths:
-            attributes["component_source_paths"] = list(component.source_paths)
+        if len(selected_components) == 1:
+            component = selected_components[0]
+            attributes.pop("component_names", None)
+            attributes["component_name"] = component.name
+            if component.role is not None:
+                attributes["component_role"] = component.role
+            else:
+                attributes.pop("component_role", None)
+            if component.source_paths:
+                attributes["component_source_paths"] = list(component.source_paths)
+            else:
+                attributes.pop("component_source_paths", None)
+        else:
+            attributes.pop("component_name", None)
+            attributes.pop("component_role", None)
+            attributes["component_names"] = list(names)
+            attributes["component_source_paths"] = list(
+                dict.fromkeys(path for component in selected_components for path in component.source_paths)
+            )
+        shared_weights: dict[str, dict] = {}
+        for component in selected_components:
+            for shared_weight in component.shared_weights:
+                serialized = shared_weight.to_json()
+                existing = shared_weights.get(shared_weight.name)
+                if existing is not None and existing != serialized:
+                    raise ValueError(f"Components disagree on shared weight {shared_weight.name!r}.")
+                shared_weights[shared_weight.name] = serialized
+        if shared_weights:
+            attributes["shared_weights"] = list(shared_weights.values())
+        else:
+            attributes.pop("shared_weights", None)
         new_config["model_attributes"] = attributes
         return ModelConfig(type=self.type, config=new_config)
 

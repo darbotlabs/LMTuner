@@ -3,6 +3,8 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 # pylint: disable=protected-access
+import json
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -198,6 +200,72 @@ def test_model_config_get_components_discovers_directory_composite(tmp_path):
     assert config.get_components() == ["decoder", "embedding", "vision_encoder"]
 
 
+@pytest.mark.parametrize("names", [["decoder"], ["decoder", "embedding"]])
+def test_model_config_select_components_rebases_moved_package_without_changing_metadata(tmp_path, names):
+    package_dir = _make_export_package(tmp_path / "moved")
+    (package_dir / "genai_config.json").write_text('{"owner": "package"}', encoding="utf-8")
+    (package_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (package_dir / "decoder" / "genai_config.json").write_text('{"owner": "decoder"}', encoding="utf-8")
+    source_root = "decoder"
+    config_path = package_dir / "model_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "type": "CompositeModel",
+                "config": {
+                    "model_path": source_root,
+                    "model_component_names": ["decoder", "embedding"],
+                    "model_components": [
+                        {
+                            "type": "ONNXModel",
+                            "config": {
+                                "model_path": str(Path(source_root) / name),
+                                "onnx_file_name": "model.onnx",
+                                "model_attributes": {
+                                    "component_name": name,
+                                    **(
+                                        {"additional_files": [str(Path(source_root) / name / "genai_config.json")]}
+                                        if name == "decoder"
+                                        else {}
+                                    ),
+                                },
+                            },
+                        }
+                        for name in ("decoder", "embedding")
+                    ],
+                    "model_attributes": {
+                        "display_name": "decoder",
+                        "additional_files": [
+                            str(Path(source_root) / "genai_config.json"),
+                            str(Path(source_root) / "tokenizer.json"),
+                        ],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_config = config_path.read_bytes()
+    package = ModelConfig(type="CompositeModel", config={"model_path": str(package_dir)})
+
+    assert package.get_components() == ["decoder", "embedding"]
+    selected = package.select_components(names).create_model()
+    components = [(names[0], selected)] if len(names) == 1 else list(selected.get_model_components())
+    assert [name for name, _ in components] == names
+    for name, component in components:
+        assert component.model_path == str(package_dir / name / "model.onnx")
+        assert component.model_attributes["component_name"] == name
+        assert component.model_attributes["display_name"] == "decoder"
+        expected_config = (
+            package_dir / name / "genai_config.json" if name == "decoder" else package_dir / "genai_config.json"
+        )
+        assert set(component.model_attributes["additional_files"]) == {
+            str(expected_config),
+            str(package_dir / "tokenizer.json"),
+        }
+    assert config_path.read_bytes() == original_config
+
+
 def test_model_config_get_components_hfmodel_uses_mobius(monkeypatch):
     inspect_components = Mock(
         return_value=[mobius_utils.ComponentInfo(name="decoder", role="decoder", source_paths=["model.language_model"])]
@@ -239,11 +307,79 @@ def test_model_config_select_components_hfmodel_tags_component(monkeypatch):
     }
 
 
-def test_model_config_select_components_hfmodel_multiple_names_raises():
+def test_model_config_select_components_hfmodel_preserves_shared_weights(monkeypatch):
+    shared_weight = mobius_utils.SharedWeightInfo.coerce(
+        {
+            "name": "word_embeddings",
+            "kind": "tied_word_embeddings",
+            "canonical": {
+                "component": "embedding",
+                "parameter": "model.language_model.embed_tokens.weight",
+            },
+            "aliases": [
+                {
+                    "component": "decoder",
+                    "parameter": "lm_head.weight",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        mobius_utils,
+        "inspect_components",
+        lambda *args, **kwargs: [
+            mobius_utils.ComponentInfo(
+                name="decoder",
+                role="decoder",
+                source_paths=["model.language_model.layers", "lm_head"],
+                shared_weights=[shared_weight],
+            ),
+            mobius_utils.ComponentInfo(
+                name="embedding",
+                role="embedding",
+                source_paths=["model.language_model.embed_tokens"],
+                shared_weights=[shared_weight],
+            ),
+        ],
+    )
     config = ModelConfig.model_validate({"type": "HfModel", "config": {"model_path": "some/vlm"}})
 
-    with pytest.raises(ValueError, match="one at a time"):
-        config.select_components(["decoder", "vision_encoder"])
+    selected = config.select_components(["decoder"])
+
+    assert selected.config["model_attributes"]["shared_weights"] == [shared_weight.to_json()]
+
+
+def test_model_config_select_components_hfmodel_aggregates_multiple_components(monkeypatch):
+    monkeypatch.setattr(
+        mobius_utils,
+        "inspect_components",
+        lambda *args, **kwargs: [
+            mobius_utils.ComponentInfo(
+                name="decoder",
+                role="decoder",
+                source_paths=["model.language_model.layers", "model.language_model.norm", "lm_head"],
+            ),
+            mobius_utils.ComponentInfo(
+                name="vision_encoder",
+                role="encoder",
+                source_paths=["model.vision_tower", "model.embed_vision"],
+            ),
+        ],
+    )
+    config = ModelConfig.model_validate({"type": "HfModel", "config": {"model_path": "some/vlm"}})
+
+    selected = config.select_components(["decoder", "vision_encoder"])
+
+    assert selected.config["model_attributes"] == {
+        "component_names": ["decoder", "vision_encoder"],
+        "component_source_paths": [
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "lm_head",
+            "model.vision_tower",
+            "model.embed_vision",
+        ],
+    }
 
 
 def test_model_config_select_components_hfmodel_missing_paths_raises(monkeypatch):
@@ -265,13 +401,29 @@ def test_model_config_select_components_hfmodel_whole_model_allows_empty_paths(m
     monkeypatch.setattr(
         mobius_utils,
         "inspect_components",
-        lambda *args, **kwargs: [mobius_utils.ComponentInfo(name="model", role="decoder")],
+        lambda *args, **kwargs: [mobius_utils.ComponentInfo(name="model")],
     )
-    config = ModelConfig.model_validate({"type": "HfModel", "config": {"model_path": "some/llm"}})
+    config = ModelConfig.model_validate(
+        {
+            "type": "HfModel",
+            "config": {
+                "model_path": "some/llm",
+                "model_attributes": {
+                    "component_names": ["stale_decoder", "stale_embedding"],
+                    "component_role": "encoder",
+                    "component_source_paths": ["stale.path"],
+                    "preserved": "value",
+                },
+            },
+        }
+    )
 
     selected = config.select_components(["model"])
 
-    assert selected.config["model_attributes"] == {"component_name": "model", "component_role": "decoder"}
+    assert selected.config["model_attributes"] == {
+        "component_name": "model",
+        "preserved": "value",
+    }
 
 
 def _make_diffusers_dir(tmp_path):

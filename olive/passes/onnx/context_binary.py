@@ -2,6 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
+import json
 import logging
 import platform
 from copy import deepcopy
@@ -10,6 +11,7 @@ from typing import Optional, Union
 
 from packaging import version
 
+from olive.common.ort_genai_config import register_ort_genai_config_update
 from olive.hardware.accelerator import AcceleratorSpec, Device
 from olive.hardware.constants import ExecutionProvider
 from olive.model import CompositeModelHandler, ONNXModelHandler
@@ -54,7 +56,10 @@ class EPContextBinaryGenerator(Pass):
             "session_options": PassConfigParam(
                 type_=dict,
                 default_value=None,
-                description="Session options for the EP.",
+                description=(
+                    "Session options for the EP. Keys are added as session config entries, except"
+                    " log_severity_level and log_verbosity_level which are set as typed attributes."
+                ),
             ),
             "disable_cpu_fallback": PassConfigParam(
                 type_=bool,
@@ -65,8 +70,14 @@ class EPContextBinaryGenerator(Pass):
                 type_=bool,
                 default_value=False,
                 description=(
-                    "Whether to update the genai_config.json pipeline entry for the generated context binary."
-                    " Only applicable to QNN GPU."
+                    "Update a single-model ORT GenAI role with the generated context model and provider settings."
+                ),
+            ),
+            "genai_config_role": PassConfigParam(
+                type_=str,
+                default_value=None,
+                description=(
+                    "Top-level model role in genai_config.json to update when update_genai_config is enabled."
                 ),
             ),
         }
@@ -107,8 +118,63 @@ class EPContextBinaryGenerator(Pass):
         if config.provider_options:
             result.model_attributes["provider_options"] = config.provider_options
             result.model_attributes["architecture"] = config.provider_options.get("soc_model")
+        if config.update_genai_config:
+            if not config.genai_config_role:
+                raise ValueError("genai_config_role is required when update_genai_config is enabled.")
+            if not isinstance(result, ONNXModelHandler):
+                raise ValueError("update_genai_config only supports single-model EPContext outputs.")
+            self._update_single_model_genai_config(model, result, config)
 
         return result
+
+    def _update_single_model_genai_config(
+        self,
+        source_model: Union[ONNXModelHandler, CompositeModelHandler],
+        output_model: ONNXModelHandler,
+        config: type[BasePassConfig],
+    ) -> None:
+        role = config.genai_config_role
+        if "/" in role:
+            raise ValueError(f"Invalid genai_config_role: {role!r}")
+
+        config_paths = [
+            Path(path)
+            for path in (source_model.model_attributes or {}).get("additional_files") or []
+            if Path(path).name == "genai_config.json"
+        ]
+        if len(config_paths) != 1:
+            raise ValueError("update_genai_config requires exactly one genai_config.json additional file.")
+
+        with config_paths[0].open(encoding="utf-8") as config_file:
+            genai_config = json.load(config_file)
+        role_config = genai_config.get("model", {}).get(role)
+        if not isinstance(role_config, dict):
+            raise ValueError(f"genai_config.json does not define model role {role!r}.")
+
+        provider_options = deepcopy(config.provider_options or {})
+        if self.accelerator_spec.execution_provider == ExecutionProvider.QNNExecutionProvider:
+            backend_name = "libQnnHtp.so" if platform.system() == "Linux" else "QnnHtp.dll"
+            provider_options.setdefault("backend_path", backend_name)
+        provider_name = self.accelerator_spec.execution_provider.lower().replace("executionprovider", "")
+        session_options = deepcopy(role_config.get("session_options") or {})
+        session_options.update(deepcopy(config.session_options or {}))
+        session_options["provider_options"] = [{provider_name: provider_options}]
+
+        role_config["filename"] = Path(output_model.model_path).name
+        role_config["session_options"] = session_options
+
+        output_config_path = Path(output_model.model_path).parent / "genai_config.json"
+        with output_config_path.open("w", encoding="utf-8") as config_file:
+            json.dump(genai_config, config_file, indent=4)
+
+        output_model.model_attributes = register_ort_genai_config_update(
+            output_model.model_attributes,
+            output_config_path.name,
+            [f"/model/{role}"],
+        )
+        additional_files = set(output_model.model_attributes.get("additional_files") or [])
+        additional_files.add(str(output_config_path))
+        output_model.model_attributes["additional_files"] = sorted(additional_files)
 
     def _run_single_target(
         self,
@@ -125,7 +191,6 @@ class EPContextBinaryGenerator(Pass):
             "session_options": config.session_options,
             "embed_context": config.embed_context,
             "disable_cpu_fallback": config.disable_cpu_fallback,
-            "update_genai_config": config.update_genai_config,
             "model": model,
         }
 
@@ -282,7 +347,6 @@ class EPContextBinaryGenerator(Pass):
         share_ep_contexts: bool = False,
         stop_share_ep_contexts: bool = False,
         ignore_missing_cb_bin: bool = False,
-        update_genai_config: bool = False,
         model: Optional[Union[ONNXModelHandler, CompositeModelHandler]] = None,
         logical_name: Optional[str] = None,
     ) -> ONNXModelHandler:
@@ -297,7 +361,6 @@ class EPContextBinaryGenerator(Pass):
         :param share_ep_contexts: Whether to share EP contexts.
         :param stop_share_ep_contexts: Whether to stop sharing EP contexts.
         :param ignore_missing_cb_bin: Whether to ignore missing context binary files.
-        :param update_genai_config: Whether to update the genai_config.json pipeline entry (QNN GPU only).
         :param logical_name: Component's logical name used to update genai_config.json.
         :return: ONNXModelHandler for the generated context binary.
         """
@@ -311,24 +374,23 @@ class EPContextBinaryGenerator(Pass):
         logger.debug(" Using ABI EP: %s", str(is_abi))
 
         # prepare provider options
-        provider_options = provider_options or {}
+        provider_options = deepcopy(provider_options or {})
         if execution_provider == ExecutionProvider.QNNExecutionProvider:
             if str(device).lower() == "gpu":
                 provider_options["backend_path"] = "libQnnGpu.so" if platform.system() == "Linux" else "QnnGpu.dll"
-                if update_genai_config:
-                    ctxbin_path = (
-                        Path(output_model_path).with_name(f"{logical_name}.onnx")
-                        if logical_name
-                        else Path(output_model_path)
-                    )
-                    update_llm_pipeline_genai_config_gpu_ctxbin(model, ctxbin_path)
+                ctxbin_path = (
+                    Path(output_model_path).with_name(f"{logical_name}.onnx")
+                    if logical_name
+                    else Path(output_model_path)
+                )
+                update_llm_pipeline_genai_config_gpu_ctxbin(model, ctxbin_path)
             else:
                 provider_options["backend_path"] = "libQnnHtp.so" if platform.system() == "Linux" else "QnnHtp.dll"
                 if share_ep_contexts:
                     provider_options["enable_htp_weight_sharing"] = "1"
 
         # prepare session options
-        session_options = session_options or {}
+        session_options = deepcopy(session_options or {})
         session_options.update(
             {
                 "ep.context_enable": "1",
@@ -340,7 +402,12 @@ class EPContextBinaryGenerator(Pass):
         )
         sess_options = ort.SessionOptions()
         for key, value in session_options.items():
-            sess_options.add_session_config_entry(key, str(value))
+            # a few options are typed attributes on SessionOptions rather than string config entries.
+            # setting them with add_session_config_entry would silently have no effect.
+            if key in ("log_severity_level", "log_verbosity_level"):
+                setattr(sess_options, key, int(value))
+            else:
+                sess_options.add_session_config_entry(key, str(value))
 
         output_model_path = Path(output_model_path)
         output_model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -372,18 +439,26 @@ class EPContextBinaryGenerator(Pass):
                     )
                 else:
                     raise
-            all_ep_devices = ort.get_ep_devices()
-            selected_ep_devices = [
-                ep_device for ep_device in all_ep_devices if ep_device.ep_name == ExecutionProvider.QNNExecutionProvider
-            ]
+            session_created = False
+            try:
+                all_ep_devices = ort.get_ep_devices()
+                selected_ep_devices = [
+                    ep_device
+                    for ep_device in all_ep_devices
+                    if ep_device.ep_name == ExecutionProvider.QNNExecutionProvider
+                ]
 
-            # Add QNN EP to session for abi ep
-            sess_options.add_provider_for_devices(selected_ep_devices, provider_options)
-            ort.InferenceSession(
-                model_path,
-                sess_options=sess_options,
-            )
-            ort.unregister_execution_provider_library(ep_registration_name)
+                sess_options.add_provider_for_devices(selected_ep_devices, provider_options)
+                ort.InferenceSession(
+                    model_path,
+                    sess_options=sess_options,
+                )
+                session_created = True
+            finally:
+                # Keep successful shared contexts alive until the final component, but do not
+                # leave a registration behind when session creation fails.
+                if not session_created or not share_ep_contexts or stop_share_ep_contexts:
+                    ort.unregister_execution_provider_library(ep_registration_name)
         else:
             ort.InferenceSession(
                 model_path,
