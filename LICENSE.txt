@@ -1,0 +1,11 @@
+License Compatibility Notice
+
+Copyright (c) CypherDyne AI and DarbotLabs contributors, except where upstream or third-party notices state otherwise.
+
+DarbotLabs is a subsidiary of CypherDyne AI. This repository is a research fork or adaptation published as independent personal research and development learning material.
+
+Upstream project license terms and third-party notices continue to apply. Nothing in this notice replaces, narrows, or expands the license terms of the upstream project or any included third-party material.
+
+DarbotLabs-specific changes are provided for research, learning, and evaluation. This repository is not presented as a supported product, service, distribution channel, or production dependency commitment.
+
+Review the upstream license, this repository's license files, and all third-party notices before reuse.
