@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from olive.common.utils import StrEnumBase
 from olive.constants import Precision
@@ -56,6 +57,11 @@ class MobiusBuilder(Pass):
             "model_path": "mistralai/Ministral-3B-Instruct-2512",
             "components_to_export": ["vision_encoder", "embedding"]
         }
+
+    Use ``text_only`` to ask Mobius to export the text backbone of a supported
+    multimodal checkpoint as a standalone decoder.  Unlike
+    ``components_to_export``, this selects the model architecture during the
+    Mobius build rather than filtering components while saving the package.
 
     Raises :class:`ValueError` if ``components_to_export`` is an empty list or
     contains names not present in the built package.
@@ -111,6 +117,27 @@ class MobiusBuilder(Pass):
                     "quantization pass (e.g. OnnxMatMulNBits) after this pass."
                 ),
             ),
+            "text_only": PassConfigParam(
+                type_=bool,
+                required=False,
+                default_value=False,
+                description=(
+                    "Export the text backbone of a supported multimodal checkpoint as a standalone decoder. "
+                    "This selects the model architecture during the Mobius build and is distinct from "
+                    "components_to_export, which filters components while saving an already-built package. "
+                    "Defaults to false for backward compatibility."
+                ),
+            ),
+            "genai_config": PassConfigParam(
+                type_=dict,
+                required=False,
+                default_value=None,
+                description=(
+                    "Optional overrides for the generated genai_config.json, such as decoder session options "
+                    "and search settings. Nested dictionaries are merged; other values, including lists, "
+                    "are replaced. Requires a full package export (components_to_export unset)."
+                ),
+            ),
             "components_to_export": PassConfigParam(
                 type_=list[str],
                 required=False,
@@ -133,15 +160,19 @@ class MobiusBuilder(Pass):
         config: type[BasePassConfig],
         output_model_path: str,
     ) -> ONNXModelHandler | CompositeModelHandler:
+        if not isinstance(model, HfModelHandler):
+            raise ValueError(f"MobiusBuilder requires an HfModelHandler input, got {type(model).__name__}.")
+
+        from olive.common.quant.hf_utils import validate_olive_onnx_export
+
+        validate_olive_onnx_export(model.get_hf_model_config().to_dict().get("quantization_config") or {})
+
         try:
             from mobius import build
         except ImportError as exc:
             raise ImportError(
                 "mobius-onnx is required to run MobiusBuilder. Install with: pip install mobius-onnx"
             ) from exc
-
-        if not isinstance(model, HfModelHandler):
-            raise ValueError(f"MobiusBuilder requires an HfModelHandler input, got {type(model).__name__}.")
 
         # Map Olive EP to mobius EP. If unsupported/unknown, fall back to mobius default EP.
         requested_ep = self.accelerator_spec.execution_provider
@@ -157,8 +188,9 @@ class MobiusBuilder(Pass):
         dtype_str: str = _PRECISION_TO_DTYPE.get(config.precision, "f32")
         model_id: str = model.model_name_or_path
 
-        # Read trust_remote_code from the model's HuggingFace load kwargs.
-        trust_remote_code: bool = model.get_load_kwargs().get("trust_remote_code", False)
+        load_kwargs = model.get_load_kwargs()
+        revision: str | None = load_kwargs.get("revision")
+        trust_remote_code: bool = load_kwargs.get("trust_remote_code", False)
 
         logger.info(
             "MobiusBuilder: building '%s' (ep=%s, dtype=%s)",
@@ -176,16 +208,22 @@ class MobiusBuilder(Pass):
                 "MobiusBuilder: components_to_export cannot be empty. "
                 "Pass None to export all components, or specify at least one component name."
             )
+        if config.components_to_export is not None and config.genai_config:
+            raise ValueError("MobiusBuilder: genai_config overrides require a full package export.")
 
         output_dir = Path(output_model_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        text_only_kwargs = {"text_only": True} if config.text_only else {}
+        revision_kwargs = {"revision": revision} if revision is not None else {}
         pkg = build(
             model_id,
             dtype=dtype_str,
             execution_provider=ep_str,
             load_weights=True,
             trust_remote_code=trust_remote_code,
+            **text_only_kwargs,
+            **revision_kwargs,
         )
 
         # Determine which package components to export.
@@ -234,7 +272,16 @@ class MobiusBuilder(Pass):
         else:
             # Generate ORT GenAI config artifacts (genai_config.json, tokenizer
             # files, processor configs) alongside the ONNX models.
-            genai_artifacts = self._write_genai_config(pkg, str(output_dir), model_id, ep_str)
+            genai_artifacts = self._write_genai_config(
+                pkg,
+                str(output_dir),
+                model_id,
+                ep_str,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+            )
+            if config.genai_config:
+                self._update_genai_config(output_dir, config.genai_config)
 
         logger.info("MobiusBuilder: saved components %s to '%s'", package_keys, output_dir)
 
@@ -316,7 +363,28 @@ class MobiusBuilder(Pass):
         )
 
     @staticmethod
-    def _write_genai_config(pkg, output_dir: str, model_id: str, ep: str) -> dict[str, str]:
+    def _update_genai_config(output_dir: Path, overrides: dict) -> None:
+        def merge(target: dict, updates: dict) -> None:
+            for key, value in updates.items():
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge(target[key], value)
+                else:
+                    target[key] = value
+
+        config_path = output_dir / "genai_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        merge(config, overrides)
+        config_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _write_genai_config(
+        pkg: Any,
+        output_dir: str,
+        model_id: str,
+        ep: str,
+        revision: str | None = None,
+        trust_remote_code: bool = False,
+    ) -> dict[str, str]:
         """Generate ORT GenAI config artifacts alongside the ONNX models.
 
         Returns:
@@ -325,11 +393,17 @@ class MobiusBuilder(Pass):
         """
         from mobius.integrations.ort_genai import write_ort_genai_config
 
+        load_options = {}
+        if revision is not None:
+            load_options["revision"] = revision
+        if trust_remote_code:
+            load_options["trust_remote_code"] = True
         genai_artifacts = write_ort_genai_config(
             pkg,
             output_dir,
             hf_model_id=model_id,
             ep=ep,
+            **load_options,
         )
         logger.info(
             "MobiusBuilder: wrote ORT GenAI config: %s",

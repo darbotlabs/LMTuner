@@ -125,7 +125,7 @@
             "supported_algorithms": [ "gptq", "quarot", "spinquant" ],
             "supported_quantization_encodings": [  ],
             "dataset": "dataset_optional",
-            "module_dependencies": [ "gptqmodel", "optimum" ]
+            "module_dependencies": [ "gptqmodel>=7.4.0", "optimum" ]
         },
         "GraphSurgeries": {
             "module_path": "olive.passes.onnx.graph_surgeries.GraphSurgeries",
@@ -200,6 +200,14 @@
             "supported_providers": [ "QNNExecutionProvider" ],
             "supported_accelerators": [ "npu" ],
             "supported_precisions": [ "*" ],
+            "supported_algorithms": [  ],
+            "supported_quantization_encodings": [  ]
+        },
+        "GenAIModelRuntimeProfiles": {
+            "module_path": "olive.passes.onnx.genai_runtime_profiles.GenAIModelRuntimeProfiles",
+            "supported_providers": [ "CUDAExecutionProvider" ],
+            "supported_accelerators": [ "gpu" ],
+            "supported_precisions": [ "int4", "int8", "fp16", "fp32" ],
             "supported_algorithms": [  ],
             "supported_quantization_encodings": [  ]
         },
@@ -643,7 +651,8 @@
             "supported_accelerators": [ "*" ],
             "supported_precisions": [ "int4", "int8", "uint4", "uint8" ],
             "supported_algorithms": [ "kquant" ],
-            "supported_quantization_encodings": [  ]
+            "supported_quantization_encodings": [  ],
+            "thread_safe": false
         },
         "QuaRot": {
             "module_path": "olive.passes.pytorch.rotate.QuaRot",
@@ -661,7 +670,8 @@
             "supported_accelerators": [ "*" ],
             "supported_precisions": [ "int4", "int8", "uint4", "uint8" ],
             "supported_algorithms": [ "rtn" ],
-            "supported_quantization_encodings": [  ]
+            "supported_quantization_encodings": [  ],
+            "thread_safe": false
         },
         "SaveTestModelConfig": {
             "module_path": "olive.passes.pytorch.save_test_model_config.SaveTestModelConfig",
@@ -717,6 +727,14 @@
         },
         "SplitModel": {
             "module_path": "olive.passes.onnx.split.SplitModel",
+            "supported_providers": [ "*" ],
+            "supported_accelerators": [ "*" ],
+            "supported_precisions": [ "*" ],
+            "supported_algorithms": [  ],
+            "supported_quantization_encodings": [  ]
+        },
+        "SplitVisionPooler": {
+            "module_path": "olive.passes.onnx.split_vision_pooler.SplitVisionPooler",
             "supported_providers": [ "*" ],
             "supported_accelerators": [ "*" ],
             "supported_precisions": [ "*" ],
@@ -791,6 +809,7 @@
             "nncf>=2.19.0",
             "numpy<2.0",
             "optimum[openvino]>=2.1.0",
+            "optimum-intel>=1.26.0",
             "onnxruntime-openvino"
         ],
         "optimum": [ "optimum" ],

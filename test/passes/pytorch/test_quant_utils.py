@@ -3,7 +3,6 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 # pylint: disable=protected-access,redefined-outer-name,not-callable
-import logging
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -28,13 +27,50 @@ from olive.constants import PrecisionBits
 from olive.model import HfModelHandler
 from olive.passes.pytorch import quant_utils as quant_utils_module
 from olive.passes.pytorch.quant_utils import (
-    _quant_config_rank,
+    _retie_meta_parameters_for_save,
     finalize,
-    normalize_qkv_quant_config,
+    get_quant_config,
     prepare_model,
     run_layerwise_quantization,
+    validate_moe_quantization_requirement,
 )
 from test.utils import get_tiny_phi3
+
+
+def test_retie_meta_parameters_for_save_resolves_ties_and_rejects_unresolved():
+    class TiedModel(nn.Module):
+        def __init__(self, resolve_tie, expose_embeddings=False, tie_word_embeddings=False):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(8, 4)
+            self.lm_head = nn.Linear(4, 8, bias=False, device="meta")
+            self.resolve_tie = resolve_tie
+            self.expose_embeddings = expose_embeddings
+            self.config = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
+
+        def tie_weights(self):
+            if self.resolve_tie:
+                self.lm_head.weight = self.embed_tokens.weight
+
+        def get_input_embeddings(self):
+            return self.embed_tokens if self.expose_embeddings else None
+
+        def get_output_embeddings(self):
+            return self.lm_head if self.expose_embeddings else None
+
+    model = TiedModel(resolve_tie=True, tie_word_embeddings=True)
+    _retie_meta_parameters_for_save(model)
+    assert model.lm_head.weight is model.embed_tokens.weight
+
+    model = TiedModel(resolve_tie=False, expose_embeddings=True)
+    _retie_meta_parameters_for_save(model, tie_word_embeddings=True)
+    assert model.lm_head.weight is model.embed_tokens.weight
+
+    with pytest.raises(ValueError, match="remain on the meta device"):
+        _retie_meta_parameters_for_save(TiedModel(resolve_tie=False, expose_embeddings=True))
+
+    with pytest.raises(ValueError, match="remain on the meta device"):
+        _retie_meta_parameters_for_save(TiedModel(resolve_tie=False))
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -58,6 +94,31 @@ def input_model_fixture(tmp_path_factory):
     return HfModelHandler(save_path)
 
 
+@pytest.fixture(name="moe_input_model", scope="module")
+def moe_input_model_fixture(tmp_path_factory):
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    save_path = tmp_path_factory.mktemp("quant-utils-moe-test")
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(  # pylint: disable=unexpected-keyword-arg
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=16,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_experts=2,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            head_dim=8,
+            experts_implementation="eager",
+        )
+    )
+    model.save_pretrained(save_path)
+    return HfModelHandler(save_path)
+
+
 def _baseline_pass_config(overrides=None, *, embeds=False):
     return SimpleNamespace(
         bits=PrecisionBits.BITS4,
@@ -67,6 +128,508 @@ def _baseline_pass_config(overrides=None, *, embeds=False):
         embeds=embeds,
         overrides=overrides,
     )
+
+
+def _with_required_moe_plan(
+    model: HfModelHandler, additional_overrides=None, *, include_fused_override=True
+) -> HfModelHandler:
+    overrides = (
+        {"model.layers.0.mlp.experts.down_proj": {"bits": PrecisionBits.BITS8}} if include_fused_override else {}
+    )
+    overrides.update(additional_overrides or {})
+    return HfModelHandler(
+        model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4},
+                "overrides": overrides,
+                "requires_moe": True,
+            }
+        },
+    )
+
+
+def _load_uncached_model(model: HfModelHandler):
+    model.model = None
+    return model.load_model()
+
+
+def test_get_quant_config_requires_explicit_moe_opt_in(input_model):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4},
+                "overrides": {"model.layers.0.mlp.experts.down_proj": {"bits": PrecisionBits.BITS8}},
+                "requires_moe": True,
+            }
+        },
+    )
+    config = _baseline_pass_config()
+    config.moe = False
+
+    with pytest.raises(ValueError, match=r"requires MoE quantization.*moe=True"):
+        get_quant_config(model, config)
+
+
+def test_get_quant_config_accepts_requires_moe_with_explicit_consumer_opt_in(input_model):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4, "moe": False},
+                "overrides": {"model.layers.0.mlp.experts.down_proj": {"bits": PrecisionBits.BITS8}},
+                "requires_moe": True,
+            }
+        },
+    )
+    config = _baseline_pass_config(overrides={"model.layers.0.mlp.experts.down_proj": {"bits": 2}})
+    config.moe = True
+
+    qcfg = get_quant_config(model, config)
+
+    assert qcfg.moe is True
+    assert qcfg.get_qlinear_init_args("model.layers.0.mlp.experts.down_proj")["bits"] == 2
+
+
+def test_get_quant_config_metadata_default_cannot_enable_consumer_moe(input_model):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4, "moe": True},
+                "overrides": {"model.layers.0.mlp.experts.down_proj": {"bits": PrecisionBits.BITS8}},
+            }
+        },
+    )
+    config = _baseline_pass_config()
+    config.moe = False
+
+    qcfg = get_quant_config(model, config)
+
+    assert qcfg.moe is False
+    assert qcfg.get_qlinear_init_args("model.layers.0.mlp.experts.down_proj")["bits"] == PrecisionBits.BITS8
+
+
+def test_get_quant_config_allows_consumer_without_moe_field(input_model):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4},
+                "overrides": {},
+                "requires_moe": True,
+            }
+        },
+    )
+
+    qcfg = get_quant_config(model, _baseline_pass_config())
+
+    assert qcfg.moe is False
+
+
+@pytest.mark.parametrize(
+    "existing_qcfg",
+    [
+        {"quant_method": "olive", "moe": True},
+        OliveHfQuantizationConfig(
+            bits=PrecisionBits.BITS4,
+            symmetric=False,
+            group_size=16,
+            moe=True,
+        ),
+    ],
+)
+def test_validate_moe_requirement_allows_follow_up_after_existing_moe_quantization(input_model, existing_qcfg):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4},
+                "overrides": {},
+                "requires_moe": True,
+            }
+        },
+    )
+    config = _baseline_pass_config()
+    config.moe = False
+
+    validate_moe_quantization_requirement(model, config, existing_qcfg)
+
+
+def test_prepare_model_rejects_unfulfilled_moe_requirement_before_model_load(input_model, monkeypatch):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {"bits": PrecisionBits.BITS4},
+                "overrides": {},
+                "requires_moe": True,
+            }
+        },
+    )
+    config = _baseline_pass_config()
+    config.moe = False
+    monkeypatch.setattr(
+        quant_utils_module,
+        "load_hf_base_model",
+        lambda *_args, **_kwargs: pytest.fail("model loading must not be reached"),
+    )
+
+    with pytest.raises(ValueError, match=r"requires MoE quantization.*moe=True"):
+        prepare_model(model, config)
+
+
+@pytest.mark.parametrize("requires_moe", ["false", 1, [], {}])
+def test_get_quant_config_rejects_non_bool_requires_moe(input_model, requires_moe):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "mixed_precision_info": {
+                "default": {},
+                "overrides": {},
+                "requires_moe": requires_moe,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"requires_moe must be a bool"):
+        get_quant_config(model, _baseline_pass_config())
+
+
+@pytest.mark.parametrize(
+    "mixed_precision_info",
+    [
+        [],
+        {"default": [], "overrides": {}},
+        {"default": {}, "overrides": []},
+        {"default": {}, "overrides": {"model.layers.0.mlp.down_proj": []}},
+    ],
+)
+def test_get_quant_config_rejects_malformed_mixed_precision_mappings(input_model, mixed_precision_info):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={"mixed_precision_info": mixed_precision_info},
+    )
+
+    with pytest.raises(ValueError, match=r"mixed_precision_info.*must be a mapping"):
+        get_quant_config(model, _baseline_pass_config())
+
+
+@pytest.mark.parametrize("moe", ["false", 1, []])
+def test_prepare_model_rejects_non_bool_existing_olive_moe_before_load(input_model, monkeypatch, moe):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS4,
+        "symmetric": False,
+        "group_size": 16,
+        "moe": moe,
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    monkeypatch.setattr(
+        quant_utils_module,
+        "load_hf_base_model",
+        lambda *_args, **_kwargs: pytest.fail("model loading must not be reached"),
+    )
+
+    with pytest.raises(ValueError, match=r"quantization_config\.moe must be a bool"):
+        prepare_model(input_model, _baseline_pass_config(), allow_quantized=True)
+
+
+def test_prepare_model_required_moe_target_excluded_fails_without_parameter_mutation(moe_input_model, monkeypatch):
+    root_model = _load_uncached_model(moe_input_model)
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model)
+    config = _baseline_pass_config()
+    config.moe = True
+    config.modules_to_not_convert = ["model.layers.0.mlp.experts.down_proj"]
+
+    with pytest.raises(ValueError, match=r"Missing required names:.*experts\.down_proj"):
+        prepare_model(model, config)
+
+    assert all(not hasattr(param, "quant_info") for param in root_model.parameters())
+
+
+def test_prepare_model_required_moe_target_selected_by_current_pass(moe_input_model, monkeypatch):
+    root_model = _load_uncached_model(moe_input_model)
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(
+        moe_input_model,
+        {"model.layers.0.self_attn.q_proj": {"bits": PrecisionBits.BITS8}},
+    )
+    config = _baseline_pass_config(overrides={"model.layers.0.mlp.experts.down_proj": {"bits": PrecisionBits.BITS2}})
+    config.moe = True
+
+    _, qcfg, _ = prepare_model(model, config)
+
+    down_proj = root_model.model.layers[0].mlp.experts.down_proj
+    assert down_proj.quant_info.quantizer.bits == PrecisionBits.BITS2
+    assert qcfg.get_qlinear_init_args("model.layers.0.mlp.experts.down_proj")["bits"] == PrecisionBits.BITS2
+    assert qcfg.get_qlinear_init_args("model.layers.0.self_attn.q_proj")["bits"] == PrecisionBits.BITS8
+
+
+def test_prepare_model_required_moe_default_only_plan_selects_all_fused_targets(moe_input_model, monkeypatch):
+    root_model = _load_uncached_model(moe_input_model)
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model, include_fused_override=False)
+    config = _baseline_pass_config()
+    config.moe = True
+
+    prepare_model(model, config)
+
+    experts = root_model.model.layers[0].mlp.experts
+    assert experts.gate_up_proj.quant_info.quantizer.bits == PrecisionBits.BITS4
+    assert experts.down_proj.quant_info.quantizer.bits == PrecisionBits.BITS4
+
+
+def test_prepare_model_required_moe_plan_rejects_stale_override_name(moe_input_model, monkeypatch):
+    root_model = _load_uncached_model(moe_input_model)
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    stale_name = "model.layers.0.mlp.experts.removed_proj"
+    model = _with_required_moe_plan(moe_input_model, {stale_name: {"bits": PrecisionBits.BITS8}})
+    config = _baseline_pass_config()
+    config.moe = True
+
+    with pytest.raises(ValueError, match=r"Stale override names:.*experts\.removed_proj"):
+        prepare_model(model, config)
+
+    assert all(not hasattr(param, "quant_info") for param in root_model.parameters())
+
+
+def test_prepare_model_required_moe_target_already_materialized(moe_input_model, monkeypatch):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS8,
+        "symmetric": True,
+        "group_size": 4,
+        "lm_head": False,
+        "embeds": False,
+        "moe": True,
+        "overrides": {},
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    root_model = _load_uncached_model(moe_input_model)
+    experts = root_model.model.layers[0].mlp.experts
+    for parameter_name in ("gate_up_proj", "down_proj"):
+        parameter = getattr(experts, parameter_name)
+        install_quant_tensor_param(
+            experts,
+            parameter_name,
+            QuantTensor.from_float(
+                parameter.detach(),
+                bits=8,
+                symmetric=True,
+                group_size=4,
+            ),
+        )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(
+        moe_input_model,
+        {
+            "model.layers.0.mlp.experts.down_proj": {
+                "bits": PrecisionBits.BITS8,
+                "symmetric": True,
+                "group_size": 4,
+            }
+        },
+    )
+    config = _baseline_pass_config()
+    config.moe = False
+
+    _, qcfg, _ = prepare_model(model, config, allow_quantized=True)
+
+    assert isinstance(experts.down_proj, QuantTensor)
+    assert isinstance(experts.gate_up_proj, QuantTensor)
+    assert qcfg.moe is True
+
+
+def test_prepare_model_default_only_plan_accepts_complete_existing_moe_checkpoint(moe_input_model, monkeypatch):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS4,
+        "symmetric": False,
+        "group_size": 4,
+        "lm_head": False,
+        "embeds": False,
+        "moe": True,
+        "overrides": {},
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    root_model = _load_uncached_model(moe_input_model)
+    experts = root_model.model.layers[0].mlp.experts
+    for parameter_name in ("gate_up_proj", "down_proj"):
+        install_quant_tensor_param(
+            experts,
+            parameter_name,
+            QuantTensor.from_float(
+                getattr(experts, parameter_name).detach(),
+                bits=4,
+                symmetric=False,
+                group_size=4,
+            ),
+        )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model, include_fused_override=False)
+    config = _baseline_pass_config()
+    config.moe = False
+
+    _, qcfg, _ = prepare_model(model, config, allow_quantized=True)
+
+    assert isinstance(experts.gate_up_proj, QuantTensor)
+    assert isinstance(experts.down_proj, QuantTensor)
+    assert qcfg.moe is True
+
+
+def test_prepare_model_required_moe_target_already_materialized_with_required_mismatch_fails(
+    moe_input_model, monkeypatch
+):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS4,
+        "symmetric": False,
+        "group_size": 4,
+        "lm_head": False,
+        "embeds": False,
+        "moe": True,
+        "overrides": {},
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    root_model = _load_uncached_model(moe_input_model)
+    experts = root_model.model.layers[0].mlp.experts
+    install_quant_tensor_param(
+        experts,
+        "down_proj",
+        QuantTensor.from_float(
+            experts.down_proj.detach(),
+            bits=4,
+            symmetric=False,
+            group_size=4,
+        ),
+    )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model)
+    config = _baseline_pass_config()
+    config.moe = False
+
+    with pytest.raises(ValueError, match=r"does not satisfy.*mixed_precision_info override"):
+        prepare_model(model, config, allow_quantized=True)
+
+    assert not hasattr(experts.gate_up_proj, "quant_info")
+
+
+def test_prepare_model_required_moe_target_rejects_quant_tensor_inconsistent_with_qcfg(moe_input_model, monkeypatch):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS8,
+        "symmetric": True,
+        "group_size": 4,
+        "lm_head": False,
+        "embeds": False,
+        "moe": True,
+        "overrides": {},
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    root_model = _load_uncached_model(moe_input_model)
+    experts = root_model.model.layers[0].mlp.experts
+    install_quant_tensor_param(
+        experts,
+        "down_proj",
+        QuantTensor.from_float(
+            experts.down_proj.detach(),
+            bits=4,
+            symmetric=True,
+            group_size=4,
+        ),
+    )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model)
+    config = _baseline_pass_config()
+    config.moe = False
+
+    with pytest.raises(ValueError, match=r"inconsistent with its effective existing Olive quantization config"):
+        prepare_model(model, config, allow_quantized=True)
+
+    assert not hasattr(experts.gate_up_proj, "quant_info")
+
+
+def test_prepare_model_stale_existing_moe_flag_with_float_expert_fails_without_mutation(moe_input_model, monkeypatch):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS4,
+        "symmetric": False,
+        "group_size": 16,
+        "lm_head": False,
+        "embeds": False,
+        "moe": True,
+        "overrides": {},
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    root_model = _load_uncached_model(moe_input_model)
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model)
+    config = _baseline_pass_config()
+    config.moe = False
+
+    with pytest.raises(ValueError, match=r"Missing required names:.*experts\.down_proj"):
+        prepare_model(model, config, allow_quantized=True)
+
+    assert all(not hasattr(param, "quant_info") for param in root_model.parameters())
+
+
+def test_prepare_model_default_only_plan_rejects_incomplete_existing_moe_checkpoint(moe_input_model, monkeypatch):
+    existing = {
+        "quant_method": "olive",
+        "bits": PrecisionBits.BITS4,
+        "symmetric": False,
+        "group_size": 4,
+        "lm_head": False,
+        "embeds": False,
+        "moe": True,
+        "overrides": {},
+    }
+    _with_existing_quantization_config(monkeypatch, existing)
+    root_model = _load_uncached_model(moe_input_model)
+    experts = root_model.model.layers[0].mlp.experts
+    install_quant_tensor_param(
+        experts,
+        "down_proj",
+        QuantTensor.from_float(
+            experts.down_proj.detach(),
+            bits=4,
+            symmetric=False,
+            group_size=4,
+        ),
+    )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model, include_fused_override=False)
+    config = _baseline_pass_config()
+    config.moe = False
+
+    with pytest.raises(ValueError, match=r"Missing required names:.*experts\.gate_up_proj"):
+        prepare_model(model, config, allow_quantized=True)
+
+    assert not hasattr(experts.gate_up_proj, "quant_info")
+
+
+def test_prepare_model_required_moe_failure_does_not_untie_embeddings(moe_input_model, monkeypatch):
+    root_model = _load_uncached_model(moe_input_model)
+    root_model.config.tie_word_embeddings = True
+    root_model.tie_weights()
+    tied_weight = root_model.get_input_embeddings().weight
+    assert root_model.get_output_embeddings().weight is tied_weight
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = _with_required_moe_plan(moe_input_model)
+    config = _baseline_pass_config(embeds=True)
+    config.lm_head = True
+    config.moe = True
+    config.modules_to_not_convert = ["model.layers.0.mlp.experts.down_proj"]
+
+    with pytest.raises(ValueError, match=r"Missing required names:.*experts\.down_proj"):
+        prepare_model(model, config)
+
+    assert root_model.config.tie_word_embeddings is True
+    assert root_model.get_input_embeddings().weight is tied_weight
+    assert root_model.get_output_embeddings().weight is tied_weight
 
 
 def test_resolve_layerwise_device_warns_when_falling_back_to_cpu(monkeypatch):
@@ -175,122 +738,107 @@ def test_get_layer_inputs_cleans_up_after_forward_error(monkeypatch):
     assert all(calls == ["cpu", "cpu"] for calls in to_calls.values())
 
 
-# ---------------------------------------------------------------------------
-# _quant_config_rank
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("attention_implementation", ["eager", "sdpa"])
+@torch.no_grad()
+def test_gemma4_layerwise_replay_matches_normal_forward(tmp_path, monkeypatch, attention_implementation):
+    pytest.importorskip("transformers.models.gemma4")
+    from transformers import Gemma4ForCausalLM, Gemma4TextConfig
 
-
-def test_quant_config_rank_prefers_bits_then_smaller_positive_group_size():
-    """Higher bits win; among equal bits, smaller positive group sizes win; per-tensor is worst."""
-    symmetric_qargs = {"bits": PrecisionBits.BITS4, "group_size": 16, "symmetric": True}
-    asymmetric_qargs = {"bits": PrecisionBits.BITS4, "group_size": 16, "symmetric": False}
-    group_size_qargs = [
-        {"bits": PrecisionBits.BITS4, "group_size": 128, "symmetric": True},
-        {"bits": PrecisionBits.BITS4, "group_size": 32, "symmetric": True},
-        {"bits": PrecisionBits.BITS4, "group_size": -1, "symmetric": True},
-        {"bits": PrecisionBits.BITS4, "group_size": 0, "symmetric": True},
+    config = Gemma4TextConfig(  # pylint: disable=unexpected-keyword-arg
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        global_head_dim=32,
+        hidden_size_per_layer_input=16,
+        vocab_size_per_layer_input=64,
+        layer_types=["sliding_attention", "full_attention"] * 2,
+        num_kv_shared_layers=2,
+        sliding_window=8,
+    )
+    model = Gemma4ForCausalLM(config).eval()
+    model.set_attn_implementation(attention_implementation)
+    generator = torch.Generator().manual_seed(0)
+    samples = [
+        {
+            "input_ids": torch.randint(1, 64, (1, 24), generator=generator),
+            "attention_mask": torch.ones((1, 24), dtype=torch.long),
+        }
+        for _ in range(2)
     ]
-    higher_bit_qargs = {"bits": PrecisionBits.BITS8, "group_size": 128, "symmetric": True}
+    samples[1]["attention_mask"][:, -3:] = 0
+    expected_inputs = [[] for _ in model.model.layers]
+    expected_outputs = [[] for _ in model.model.layers]
+    hooks = []
+    for index, layer in enumerate(model.model.layers):
 
-    assert _quant_config_rank(symmetric_qargs) == _quant_config_rank(asymmetric_qargs)
-    assert max(group_size_qargs, key=_quant_config_rank) == group_size_qargs[1]
-    assert max(group_size_qargs[2:], key=_quant_config_rank) == group_size_qargs[2]
-    assert max([*group_size_qargs, higher_bit_qargs], key=_quant_config_rank) == higher_bit_qargs
+        def record_inputs(_module, args, kwargs, index=index):
+            expected_inputs[index].append(
+                {
+                    "ple": args[1].clone(),
+                    "rotary": tuple(value.clone() for value in kwargs["position_embeddings"]),
+                    "mask": kwargs["attention_mask"].clone() if kwargs["attention_mask"] is not None else None,
+                    "kv": {
+                        key: tuple(value.clone() for value in pair) for key, pair in kwargs["shared_kv_states"].items()
+                    },
+                }
+            )
 
+        def record_outputs(_module, _args, output, index=index):
+            expected_outputs[index].append(output.clone())
 
-# ---------------------------------------------------------------------------
-# normalize_qkv_quant_config
-# ---------------------------------------------------------------------------
+        hooks.append(layer.register_forward_pre_hook(record_inputs, with_kwargs=True))
+        hooks.append(layer.register_forward_hook(record_outputs))
+    for sample in samples:
+        model(**sample, use_cache=False)
+    for hook in hooks:
+        hook.remove()
 
-
-def test_normalize_qkv_quant_config_does_not_rewrite_locked_overrides(input_model):
-    """Locked QKV overrides preserved; others match the locked member.
-
-    A locked (already-quantized) QKV member's override is preserved; new members are
-    promoted/demoted to match it instead of the rank-based winner.
-    """
-    model = input_model.load_model()
+    monkeypatch.setattr(quant_utils_module, "get_calibration_dataset", lambda *_: samples)
     wrapper = ModelWrapper.from_model(model)
-    qcfg = OliveHfQuantizationConfig(
-        bits=PrecisionBits.BITS8,
-        symmetric=True,
-        group_size=16,
-        overrides={
-            # Locked: already physically quantized at 4-bit asymmetric.
-            "model.layers.0.self_attn.q_proj": {
-                "bits": PrecisionBits.BITS4,
-                "symmetric": False,
-                "group_size": 16,
-            },
-        },
+    config.save_pretrained(tmp_path)
+    hidden_states, layer_args, layer_kwargs = quant_utils_module.get_layer_inputs_for_calibration(
+        HfModelHandler(model_path=str(tmp_path)), wrapper, data_config=None, device="cpu"
     )
-    locked = {"model.layers.0.self_attn.q_proj"}
-
-    normalize_qkv_quant_config(wrapper, qcfg, locked_modules=locked)
-
-    expected = {"bits": PrecisionBits.BITS4, "symmetric": False, "group_size": 16}
-    for proj in ("q_proj", "k_proj", "v_proj"):
-        assert qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}") == expected
-
-
-def test_normalize_qkv_quant_config_skips_group_with_conflicting_locked_members(input_model):
-    """Conflicting locked members in a QKV group → skip with debug log."""
-    model = input_model.load_model()
-    wrapper = ModelWrapper.from_model(model)
-    qcfg = OliveHfQuantizationConfig(
-        bits=PrecisionBits.BITS8,
-        symmetric=True,
-        group_size=16,
-        overrides={
-            "model.layers.0.self_attn.q_proj": {
-                "bits": PrecisionBits.BITS4,
-                "symmetric": False,
-                "group_size": 16,
-            },
-            "model.layers.0.self_attn.k_proj": {
-                "bits": PrecisionBits.BITS8,
-                "symmetric": True,
-                "group_size": 32,
-            },
-        },
-    )
-    locked = {
-        "model.layers.0.self_attn.q_proj",
-        "model.layers.0.self_attn.k_proj",
-    }
-
-    records: list[logging.LogRecord] = []
-
-    class _ListHandler(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    handler = _ListHandler(level=logging.DEBUG)
-    quant_utils_module.logger.addHandler(handler)
-    quant_utils_module.logger.setLevel(logging.DEBUG)
-    try:
-        normalize_qkv_quant_config(wrapper, qcfg, locked_modules=locked)
-    finally:
-        quant_utils_module.logger.removeHandler(handler)
-
-    # Locked overrides untouched.
-    assert qcfg.get_qlinear_init_args("model.layers.0.self_attn.q_proj") == {
-        "bits": PrecisionBits.BITS4,
-        "symmetric": False,
-        "group_size": 16,
-    }
-    assert qcfg.get_qlinear_init_args("model.layers.0.self_attn.k_proj") == {
-        "bits": PrecisionBits.BITS8,
-        "symmetric": True,
-        "group_size": 32,
-    }
-    # V was not in the locked set; since the group is skipped, V keeps the base config.
-    assert qcfg.get_qlinear_init_args("model.layers.0.self_attn.v_proj") == {
-        "bits": PrecisionBits.BITS8,
-        "symmetric": True,
-        "group_size": 16,
-    }
-    assert any("conflicting configs" in rec.getMessage() for rec in records)
+    assert "project_per_layer_inputs" not in model.model.__dict__
+    assert not model.model._forward_pre_hooks
+    assert not model.model.rotary_emb._forward_hooks
+    assert layer_kwargs[0]["shared_kv_states"] is not layer_kwargs[1]["shared_kv_states"]
+    shared_states = [kwargs["shared_kv_states"] for kwargs in layer_kwargs]
+    for index, layer in enumerate(model.model.layers):
+        prepared = [
+            wrapper.prepare_layerwise_inputs(index, states, args, kwargs)
+            for states, args, kwargs in zip(hidden_states, layer_args, layer_kwargs)
+        ]
+        for sample_index, (args, kwargs) in enumerate(prepared):
+            expected = expected_inputs[index][sample_index]
+            torch.testing.assert_close(args[0], expected["ple"], rtol=0, atol=0)
+            for actual, reference in zip(kwargs["position_embeddings"], expected["rotary"]):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            if expected["mask"] is None:
+                assert kwargs["attention_mask"] is None
+            else:
+                torch.testing.assert_close(kwargs["attention_mask"], expected["mask"], rtol=0, atol=0)
+            assert kwargs["shared_kv_states"] is shared_states[sample_index]
+            assert set(kwargs["shared_kv_states"]) == set(expected["kv"])
+            for key, pair in expected["kv"].items():
+                for actual, reference in zip(kwargs["shared_kv_states"][key], pair):
+                    torch.testing.assert_close(actual, reference)
+        outputs = quant_utils_module.run_layer(
+            layer,
+            hidden_states,
+            [args for args, _ in prepared],
+            [kwargs for _, kwargs in prepared],
+            return_output=True,
+        )
+        assert outputs is not None
+        for actual, reference in zip(outputs, expected_outputs[index]):
+            torch.testing.assert_close(actual, reference)
+        hidden_states = outputs
+    assert all(set(states) == {"sliding_attention", "full_attention"} for states in shared_states)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +883,46 @@ def test_prepare_model_rejects_selected_component_without_source_paths(input_mod
         prepare_model(model, _baseline_pass_config())
 
 
+def test_prepare_model_rejects_multiple_selected_components(input_model):
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "component_names": ["decoder", "vision_encoder"],
+            "component_source_paths": ["model", "vision"],
+        },
+    )
+
+    with pytest.raises(ValueError, match="exactly one selected component"):
+        prepare_model(model, _baseline_pass_config())
+
+
+def test_prepare_model_embedding_component_quantizes_all_owned_embeddings(input_model, monkeypatch):
+    root_model = LlamaForCausalLM.from_pretrained(input_model.model_path)
+    root_model.model.embed_tokens_per_layer = torch.nn.Embedding(
+        root_model.config.vocab_size,
+        root_model.config.hidden_size,
+    )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "component_name": "embedding",
+            "component_role": "embedding",
+            "component_source_paths": [
+                "model.embed_tokens",
+                "model.embed_tokens_per_layer",
+            ],
+        },
+    )
+
+    _, qcfg, _ = prepare_model(model, _baseline_pass_config(embeds=True))
+
+    assert hasattr(root_model.model.embed_tokens.weight, "quant_info")
+    assert hasattr(root_model.model.embed_tokens_per_layer.weight, "quant_info")
+    assert not match_skip("model.embed_tokens", qcfg.modules_to_not_convert)
+    assert not match_skip("model.embed_tokens_per_layer", qcfg.modules_to_not_convert)
+
+
 def test_finalize_whole_encoder_reloads_all_embeddings_as_float(
     input_model,
     monkeypatch,
@@ -368,6 +956,33 @@ def test_finalize_whole_encoder_reloads_all_embeddings_as_float(
     assert isinstance(reloaded.bert.embeddings.word_embeddings, torch.nn.Embedding)
     assert isinstance(reloaded.bert.embeddings.position_embeddings, torch.nn.Embedding)
     assert isinstance(reloaded.bert.embeddings.token_type_embeddings, torch.nn.Embedding)
+
+
+def test_finalize_whole_encoder_quantizes_only_input_embeddings(input_model, monkeypatch, tmp_path):
+    root_model = BertForSequenceClassification(
+        BertConfig(  # pylint: disable=unexpected-keyword-arg
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            vocab_size=128,
+        )
+    )
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = HfModelHandler(
+        input_model.model_path,
+        task="text-classification",
+        model_attributes={"component_name": "model", "component_role": "encoder"},
+    )
+    model.save_metadata = lambda *_, **__: []
+
+    wrapper, qcfg, _ = prepare_model(model, _baseline_pass_config(embeds=True))
+    output_model = finalize(model, str(tmp_path), wrapper, qcfg, device="cpu")
+    reloaded = output_model.load_model()
+
+    assert isinstance(reloaded.bert.embeddings.word_embeddings.weight, QuantTensor)
+    assert not isinstance(reloaded.bert.embeddings.position_embeddings.weight, QuantTensor)
+    assert not isinstance(reloaded.bert.embeddings.token_type_embeddings.weight, QuantTensor)
 
 
 def test_layerwise_quantization_rejects_embedding_role_with_decoder_wrapper(input_model, monkeypatch):
@@ -435,6 +1050,34 @@ def test_prepare_model_component_generated_exclusions_are_exact(input_model, mon
     assert hasattr(wrapper.model.weight, "quant_info")
     assert match_skip("blocks.1", qcfg.modules_to_not_convert)
     assert not match_skip("blocks.10", qcfg.modules_to_not_convert)
+
+
+@pytest.mark.parametrize("quantize_vision", [None, False])
+def test_prepare_model_scoped_vision_auto_selection_and_opt_out(input_model, monkeypatch, quantize_vision):
+    root_model = _make_nested_decoder_root(input_model)
+    root_model.config.vision_config = SimpleNamespace()
+    vision_tower = torch.nn.Linear(16, 16)
+    root_model.add_module("vision_tower", vision_tower)
+    monkeypatch.setattr(quant_utils_module, "load_hf_base_model", lambda _: root_model)
+    model = HfModelHandler(
+        input_model.model_path,
+        model_attributes={
+            "component_name": "vision_encoder",
+            "component_role": "encoder",
+            "component_source_paths": ["vision_tower"],
+        },
+    )
+    config = _baseline_pass_config()
+    config.quantize_vision = quantize_vision
+
+    _, qcfg, _ = prepare_model(model, config)
+
+    assert qcfg.quantize_vision is (quantize_vision is None)
+    assert hasattr(vision_tower.weight, "quant_info") is (quantize_vision is None)
+    assert not hasattr(
+        root_model.decoder.model.layers[0].self_attn.q_proj.weight,
+        "quant_info",
+    )
 
 
 def test_finalize_multi_path_vlm_decoder_quantizes_and_saves_full_model(
@@ -581,8 +1224,8 @@ def test_finalize_vlm_encoder_component_only_quantizes_encoder(
     assert isinstance(root_model.lm_head, torch.nn.Linear)
 
 
-def test_prepare_model_promotes_user_override_conflicts_for_qkv(input_model):
-    """User-supplied overrides on K/V promote Q to the most-precise shared config."""
+def test_prepare_model_preserves_user_override_conflicts_for_qkv(input_model):
+    """User-supplied overrides on K/V leave Q at its requested precision."""
     model = HfModelHandler(
         input_model.model_path,
         model_attributes={
@@ -609,15 +1252,17 @@ def test_prepare_model_promotes_user_override_conflicts_for_qkv(input_model):
 
     wrapper, qcfg, _ = prepare_model(model, config)
 
-    expected = {"bits": PrecisionBits.BITS8, "symmetric": True, "group_size": 16}
+    expected_high = {"bits": PrecisionBits.BITS8, "symmetric": True, "group_size": 16}
+    expected_low = {"bits": PrecisionBits.BITS4, "symmetric": False, "group_size": 16}
     for proj in ("q_proj", "k_proj", "v_proj"):
+        expected = expected_low if proj == "q_proj" else expected_high
         assert qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}") == expected
         attached = getattr(wrapper.model.model.layers[0].self_attn, proj)
-        assert attached.weight.quant_info.quantizer.bits == PrecisionBits.BITS8
+        assert attached.weight.quant_info.quantizer.bits == expected["bits"]
 
 
-def test_prepare_model_attaches_quant_info_matching_final_post_normalize_config(input_model):
-    """Each module's attached ``quant_info`` must match the final, post-normalize qcfg config."""
+def test_prepare_model_attaches_quant_info_matching_per_projection_config(input_model):
+    """Each module's attached ``quant_info`` matches its own effective config."""
     config = _baseline_pass_config(
         overrides={
             "model.layers.0.self_attn.q_proj": {"bits": PrecisionBits.BITS8, "symmetric": True, "group_size": 16},
@@ -630,7 +1275,7 @@ def test_prepare_model_attaches_quant_info_matching_final_post_normalize_config(
     for proj in ("q_proj", "k_proj", "v_proj"):
         attached_bits = getattr(attn, proj).weight.quant_info.quantizer.bits
         cfg_bits = qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}")["bits"]
-        assert attached_bits == cfg_bits == PrecisionBits.BITS8
+        assert attached_bits == cfg_bits == (PrecisionBits.BITS8 if proj == "q_proj" else PrecisionBits.BITS4)
 
 
 # ---------------------------------------------------------------------------
@@ -669,11 +1314,7 @@ def test_prepare_model_drops_embedding_override_when_embeds_disabled(input_model
 
 
 def test_prepare_model_drops_qkv_overrides_for_modules_excluded_via_exclude_attn_inputs(input_model):
-    """``exclude_attn_inputs=True`` should not leak q/k overrides into the final qcfg.
-
-    Q/K aren't quantized this pass; the follow-up pass re-derives their config from the
-    quantized (locked) V member via ``normalize_qkv_quant_config``.
-    """
+    """``exclude_attn_inputs=True`` should not leak q/k overrides into the final qcfg."""
     model = HfModelHandler(
         input_model.model_path,
         model_attributes={
@@ -700,14 +1341,14 @@ def test_prepare_model_drops_qkv_overrides_for_modules_excluded_via_exclude_attn
 
     assert not hasattr(attention.q_proj.weight, "quant_info")
     assert not hasattr(attention.k_proj.weight, "quant_info")
-    # V is quantized and promoted to the group-wide 8-bit config.
+    # V retains the pass default because its setting is independent of excluded Q/K.
     assert qcfg.get_qlinear_init_args("model.layers.0.self_attn.v_proj") == {
-        "bits": PrecisionBits.BITS8,
-        "symmetric": True,
+        "bits": PrecisionBits.BITS4,
+        "symmetric": False,
         "group_size": 16,
     }
-    assert attention.v_proj.weight.quant_info.quantizer.bits == PrecisionBits.BITS8
-    # Q/K overrides dropped; follow-up pass will rebuild them from V (locked).
+    assert attention.v_proj.weight.quant_info.quantizer.bits == PrecisionBits.BITS4
+    # Excluded Q/K overrides do not appear in the checkpoint config.
     assert "model.layers.0.self_attn.q_proj" not in (qcfg.overrides or {})
     assert "model.layers.0.self_attn.k_proj" not in (qcfg.overrides or {})
 
@@ -819,8 +1460,8 @@ def test_prepare_model_preserves_pre_existing_overrides_verbatim(input_model, mo
     assert qcfg.get_qlinear_init_args("model.layers.0.mlp.down_proj") == locked_override
 
 
-def test_prepare_model_renormalizes_qkv_after_merging_existing_quant_config(input_model, monkeypatch):
-    """After merging a pre-existing qcfg, QKV is renormalized to the locked member's config."""
+def test_prepare_model_preserves_qkv_after_merging_existing_quant_config(input_model, monkeypatch):
+    """An existing Q override does not change the precision of K/V."""
     existing_quantization_config = {
         "quant_method": "olive",
         "bits": PrecisionBits.BITS4,
@@ -840,9 +1481,10 @@ def test_prepare_model_renormalizes_qkv_after_merging_existing_quant_config(inpu
 
     _, qcfg, _ = prepare_model(input_model, _baseline_pass_config(), allow_quantized=True)
 
-    expected = {"bits": PrecisionBits.BITS8, "symmetric": True, "group_size": 16}
+    high = {"bits": PrecisionBits.BITS8, "symmetric": True, "group_size": 16}
+    low = {"bits": PrecisionBits.BITS4, "symmetric": False, "group_size": 16}
     for proj in ("q_proj", "k_proj", "v_proj"):
-        assert qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}") == expected
+        assert qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}") == (high if proj == "q_proj" else low)
 
 
 def test_prepare_model_existing_quant_config_drops_fresh_overrides_for_non_quantized_modules(input_model, monkeypatch):
@@ -926,14 +1568,7 @@ def test_prepare_model_handles_broad_skip_around_existing_quantized_module(input
 
 
 def test_prepare_model_locks_default_quantized_qkv_member_without_override(input_model, monkeypatch):
-    """A default-quantized (no override entry) QKV member is still locked.
-
-    If V was quantized at the existing config's defaults (so it has no entry in
-    ``existing_qcfg['overrides']`` but the weight IS a ``QuantTensor`` after load) and a fresh pass
-    promotes Q/K to higher precision, the QKV normalization must NOT write a new override
-    for V -- that would disagree with V's on-disk weights. Instead, Q/K should be demoted
-    to V's existing default config.
-    """
+    """An already-quantized V keeps its on-disk layout while Q receives an override."""
     qu = quant_utils_module
 
     existing = {
@@ -972,10 +1607,10 @@ def test_prepare_model_locks_default_quantized_qkv_member_without_override(input
 
     _, qcfg, _ = prepare_model(input_model, config, allow_quantized=True)
 
-    # V's on-disk config (existing defaults) is the locked promotion target; Q/K must match.
     default = {"bits": PrecisionBits.BITS4, "symmetric": False, "group_size": 16}
+    high = {"bits": PrecisionBits.BITS8, "symmetric": True, "group_size": 16}
     for proj in ("q_proj", "k_proj", "v_proj"):
-        assert qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}") == default
+        assert qcfg.get_qlinear_init_args(f"model.layers.0.self_attn.{proj}") == (high if proj == "q_proj" else default)
     # No new override added for V (it stays at defaults on disk).
     assert "model.layers.0.self_attn.v_proj" not in (qcfg.overrides or {})
 
